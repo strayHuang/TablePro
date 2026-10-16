@@ -16,6 +16,11 @@ actor SQLSchemaProvider {
     /// every column and keeping a fraction is the waste the preload exists to avoid.
     static let maxCachedTables = 300
 
+    /// How long one metadata read may hold a completion request. A scoped driver read is issued
+    /// untracked, so it can outlive its caller and no cancellation reaches it; the deadline is what
+    /// keeps a single slow read from freezing every suggestion that comes after it.
+    static let readDeadlineSeconds = 0.45
+
     /// A column list belongs to a table, and a table is a schema and a name. Keyed by the bare name,
     /// two schemas' `orders` shared one entry and each read whichever had been cached first.
     private struct ColumnCacheKey: Hashable {
@@ -36,6 +41,11 @@ actor SQLSchemaProvider {
     private var columnCache: [ColumnCacheKey: [ColumnInfo]] = [:]
     private var columnAccessOrder: [ColumnCacheKey] = []
     private var columnTasks: [ColumnCacheKey: Task<[ColumnInfo]?, Never>] = [:]
+    /// Foreign keys, cached like columns but read on demand from a JOIN `ON` completion rather
+    /// than eagerly. Absent here simply means the heuristic tiers answer instead.
+    private var foreignKeyCache: [ColumnCacheKey: [ForeignKeyInfo]] = [:]
+    private var foreignKeyAccessOrder: [ColumnCacheKey] = []
+    private var foreignKeyTasks: [ColumnCacheKey: Task<[ForeignKeyInfo]?, Never>] = [:]
     private var loadTask: Task<Void, Never>?
     private var eagerLoadSchema: String?
 
@@ -59,17 +69,22 @@ actor SQLSchemaProvider {
         let fetchAllColumns: @Sendable () async throws -> [String: [ColumnInfo]]
         let fetchSchemaTables: (@Sendable (_ schema: String) async throws -> [TableInfo])?
         let sampleFieldPaths: (@Sendable (_ table: String, _ limit: Int) async throws -> [PluginFieldPath])?
+        /// Read on demand for join-condition inference only. Absent for a scope that has no
+        /// foreign-key source, in which case the heuristic tiers still answer.
+        let fetchForeignKeys: (@Sendable (_ table: String, _ schema: String?) async throws -> [ForeignKeyInfo])?
 
         init(
             fetchColumns: @escaping @Sendable (_ table: String, _ schema: String?) async throws -> [ColumnInfo],
             fetchAllColumns: @escaping @Sendable () async throws -> [String: [ColumnInfo]],
             fetchSchemaTables: (@Sendable (_ schema: String) async throws -> [TableInfo])? = nil,
-            sampleFieldPaths: (@Sendable (_ table: String, _ limit: Int) async throws -> [PluginFieldPath])? = nil
+            sampleFieldPaths: (@Sendable (_ table: String, _ limit: Int) async throws -> [PluginFieldPath])? = nil,
+            fetchForeignKeys: (@Sendable (_ table: String, _ schema: String?) async throws -> [ForeignKeyInfo])? = nil
         ) {
             self.fetchColumns = fetchColumns
             self.fetchAllColumns = fetchAllColumns
             self.fetchSchemaTables = fetchSchemaTables
             self.sampleFieldPaths = sampleFieldPaths
+            self.fetchForeignKeys = fetchForeignKeys
         }
     }
 
@@ -158,7 +173,11 @@ actor SQLSchemaProvider {
             return cached
         }
 
-        if let inFlight = columnTasks[key] { return await inFlight.value ?? [] }
+        if let inFlight = columnTasks[key] {
+            return await withCompletionDeadline(
+                seconds: Self.readDeadlineSeconds, fallback: nil, operation: { await inFlight.value }
+            ) ?? []
+        }
         let source = metadataSource
         let driver = cachedDriver
         guard source != nil || driver != nil else { return [] }
@@ -178,21 +197,97 @@ actor SQLSchemaProvider {
             }
         }
         columnTasks[key] = task
-        let fetched = await task.value
-        guard columnTasks[key] == task else { return fetched ?? [] }
+        // The cache write runs beside the read instead of after it, so a request that has already
+        // given up on the deadline still leaves the columns ready for the next keystroke.
+        Task { [weak self] in await self?.storeColumns(await task.value, for: key, matching: task) }
+        return await withCompletionDeadline(
+            seconds: Self.readDeadlineSeconds, fallback: nil, operation: { await task.value }
+        ) ?? []
+    }
+
+    /// Landing pad for a column read: clears the in-flight slot and writes the cache for whichever
+    /// request ends up asking. A read a reset overtook writes nothing, because its slot is gone.
+    private func storeColumns(
+        _ fetched: [ColumnInfo]?,
+        for key: ColumnCacheKey,
+        matching task: Task<[ColumnInfo]?, Never>
+    ) {
+        guard columnTasks[key] == task else { return }
         columnTasks[key] = nil
-        guard let columns = fetched else { return [] }
-        if columnCache.updateValue(columns, forKey: key) == nil {
+        guard let fetched else { return }
+        if columnCache.updateValue(fetched, forKey: key) == nil {
             columnAccessOrder.append(key)
         }
         evictIfNeeded()
-        return columns
     }
 
     private func evictIfNeeded() {
         while columnAccessOrder.count > Self.maxCachedTables {
             let evicted = columnAccessOrder.removeFirst()
             columnCache.removeValue(forKey: evicted)
+        }
+    }
+
+    /// Foreign keys for a table, cached like `getColumns` (LRU + in-flight dedupe + await).
+    /// The first JOIN `ON` completion for a table reads once; every one after it is a hit.
+    func getForeignKeys(for tableName: String, schema: String? = nil) async -> [ForeignKeyInfo] {
+        let key = cacheKey(table: tableName, schema: schema)
+
+        if let cached = foreignKeyCache[key] {
+            foreignKeyAccessOrder.removeAll { $0 == key }
+            foreignKeyAccessOrder.append(key)
+            return cached
+        }
+
+        if let inFlight = foreignKeyTasks[key] {
+            return await withCompletionDeadline(
+                seconds: Self.readDeadlineSeconds, fallback: nil, operation: { await inFlight.value }
+            ) ?? []
+        }
+        let source = metadataSource
+        let driver = cachedDriver
+        guard source?.fetchForeignKeys != nil || driver != nil else { return [] }
+
+        let task = Task<[ForeignKeyInfo]?, Never> {
+            do {
+                if let fetch = source?.fetchForeignKeys {
+                    return try await fetch(tableName, schema)
+                }
+                guard let driver else { return nil }
+                return try await driver.fetchForeignKeys(table: tableName, schema: schema)
+            } catch {
+                Self.logger.error(
+                    "Foreign key fetch failed for autocomplete table=\(tableName) error=\(error.publicLogShape, privacy: .public)"
+                )
+                return nil
+            }
+        }
+        foreignKeyTasks[key] = task
+        Task { [weak self] in await self?.storeForeignKeys(await task.value, for: key, matching: task) }
+        return await withCompletionDeadline(
+            seconds: Self.readDeadlineSeconds, fallback: nil, operation: { await task.value }
+        ) ?? []
+    }
+
+    /// The foreign-key counterpart of ``storeColumns(_:for:matching:)``.
+    private func storeForeignKeys(
+        _ fetched: [ForeignKeyInfo]?,
+        for key: ColumnCacheKey,
+        matching task: Task<[ForeignKeyInfo]?, Never>
+    ) {
+        guard foreignKeyTasks[key] == task else { return }
+        foreignKeyTasks[key] = nil
+        guard let fetched else { return }
+        if foreignKeyCache.updateValue(fetched, forKey: key) == nil {
+            foreignKeyAccessOrder.append(key)
+        }
+        evictForeignKeysIfNeeded()
+    }
+
+    private func evictForeignKeysIfNeeded() {
+        while foreignKeyAccessOrder.count > Self.maxCachedTables {
+            let evicted = foreignKeyAccessOrder.removeFirst()
+            foreignKeyCache.removeValue(forKey: evicted)
         }
     }
 
@@ -231,6 +326,9 @@ actor SQLSchemaProvider {
         self.columnCache.removeAll()
         self.columnAccessOrder.removeAll()
         self.columnTasks.removeAll()
+        self.foreignKeyCache.removeAll()
+        self.foreignKeyAccessOrder.removeAll()
+        self.foreignKeyTasks.removeAll()
         self.fieldPathCache.removeAll()
         self.fieldPathTasks.removeAll()
         self.onDemandSchemaTables.removeAll()
@@ -248,6 +346,9 @@ actor SQLSchemaProvider {
         columnCache.removeAll()
         columnAccessOrder.removeAll()
         columnTasks.removeAll()
+        foreignKeyCache.removeAll()
+        foreignKeyAccessOrder.removeAll()
+        foreignKeyTasks.removeAll()
         fieldPathCache.removeAll()
         fieldPathTasks.removeAll()
     }
@@ -465,9 +566,11 @@ actor SQLSchemaProvider {
 
     /// Tables a statement can name without their schema.
     func tableCompletionItems() async -> [SQLCompletionItem] {
-        let tableData = tablesResolvableUnqualified.map { (name: $0.name, isView: $0.type == .view) }
+        let tableData = tablesResolvableUnqualified.map {
+            (name: $0.name, isView: $0.type == .view, comment: $0.comment)
+        }
         return await MainActor.run {
-            tableData.map { SQLCompletionItem.table($0.name, isView: $0.isView) }
+            tableData.map { SQLCompletionItem.table($0.name, isView: $0.isView, comment: $0.comment) }
         }
     }
 
@@ -513,9 +616,9 @@ actor SQLSchemaProvider {
     /// Falls back to fetching from the database when that schema's tables aren't loaded yet.
     func tableCompletionItems(inSchema schema: String) async -> [SQLCompletionItem] {
         let listed = await knownTables(inSchema: schema)
-        let tableData = listed.map { (name: $0.name, isView: $0.type == .view) }
+        let tableData = listed.map { (name: $0.name, isView: $0.type == .view, comment: $0.comment) }
         return await MainActor.run {
-            tableData.map { SQLCompletionItem.table($0.name, isView: $0.isView) }
+            tableData.map { SQLCompletionItem.table($0.name, isView: $0.isView, comment: $0.comment) }
         }
     }
 
@@ -730,6 +833,36 @@ actor SQLSchemaProvider {
                 item.sortPriority = 150
                 return item
             }
+        }
+    }
+}
+
+/// A wall-clock deadline around work that does not answer to cancellation.
+///
+/// ``withTimeout`` from the plugin kit still waits for its child after the deadline fires, which is
+/// the one case a completion request needs it for: an untracked scoped driver read keeps running
+/// whatever its caller does, so cancelling the await neither stops it nor releases the caller. The
+/// read is handed to an unstructured task instead, whose lifetime is its own, and the deadline
+/// settles the caller on time. Both callers race to resume, and the lock makes exactly one win.
+func withCompletionDeadline<T: Sendable>(
+    seconds: Double,
+    fallback: T,
+    operation: @escaping @Sendable () async -> T
+) async -> T {
+    await withCheckedContinuation { continuation in
+        let settled = OSAllocatedUnfairLock(initialState: false)
+        @Sendable func settle(_ value: T) {
+            let alreadySettled = settled.withLock { done -> Bool in
+                if done { return true }
+                done = true
+                return false
+            }
+            guard !alreadySettled else { return }
+            continuation.resume(returning: value)
+        }
+        Task { settle(await operation()) }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + seconds) {
+            settle(fallback)
         }
     }
 }

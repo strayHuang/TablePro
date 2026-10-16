@@ -43,11 +43,23 @@ struct SQLSnippetMarkerTests {
         #expect(expansion?.cursorOffset == 8)
     }
 
-    @Test("Only the first marker is stripped, later ones stay literal")
-    func firstMarkerWins() {
+    /// Every marker is a stop now, not just the first: a skeleton with several parameters writes all
+    /// of them and hands each to the user in turn.
+    @Test("Every marker strips and each becomes its own stop")
+    func everyMarkerBecomesAStop() {
         let expansion = SQLSnippetMarker.expand("WHERE a = ;; AND b = ;;")
-        #expect(expansion?.text == "WHERE a =  AND b = ;;")
+        #expect(expansion?.text == "WHERE a =  AND b = ")
+        #expect(expansion?.cursorOffsets == [10, 19])
+        #expect(expansion?.placeholderLengths == [0, 0])
         #expect(expansion?.cursorOffset == 10)
+    }
+
+    @Test("A marker followed by a parameter name selects that name as its placeholder")
+    func markerCarriesTheFollowingName() {
+        let expansion = SQLSnippetMarker.expand("COUNT(;;expr)")
+        #expect(expansion?.text == "COUNT(expr)")
+        #expect(expansion?.cursorOffsets == [6])
+        #expect(expansion?.placeholderLengths == [4])
     }
 
     @Test("Marker offset counts UTF-16 units after multibyte text")

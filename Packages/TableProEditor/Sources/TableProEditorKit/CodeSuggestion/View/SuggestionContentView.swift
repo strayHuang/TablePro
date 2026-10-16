@@ -98,19 +98,55 @@ struct SuggestionContentView: View {
         .id(index)
     }
 
+    /// Character budgets the panel is sized from: 字段 50、类型 20、备注 30. A row carries the field
+    /// beside its type and the note at its trailing edge, so the panel is as wide as the three
+    /// together. Each column is bounded by its own budget — 50 and 20 letters, 30 CJK characters —
+    /// and measured in the row's own font. The editor's `charWidth` is the advance of a *space*,
+    /// which is far narrower than a letter and narrower still than a CJK glyph, so sizing from it
+    /// left long labels (`t1.DocEntry = t2.DocEntry`) and Chinese comments truncated well before
+    /// their budget.
+    private static let fieldCharacterBudget = 50
+    private static let typeCharacterBudget = 20
+    private static let commentCharacterBudget = 30
+
+    /// A representative average letter advance. Used only to turn the letter budgets above into a
+    /// width, so the cap sits where a run of ordinary letters would end rather than where a run of
+    /// the widest glyphs would.
+    private static let letterSample = "abcdefghijklmnopqrstuvwxyz0123456789"
+
     private var contentWidth: CGFloat {
         let font = model.activeTextView?.font ?? NSFont.systemFont(ofSize: 12)
         let iconWidth = font.pointSize + 6
-        let maxLabelLength = min(
-            model.items.reduce(0) { current, item in
-                let labelLen = (item.label as NSString).length
-                let detailLen = ((item.detail ?? "") as NSString).length
-                return max(current, labelLen + detailLen)
-            } + 2,
-            64
+        let letterWidth = Self.averageLetterWidth(for: font)
+        let maxFieldWidth = CGFloat(Self.fieldCharacterBudget) * letterWidth
+        let maxTypeWidth = CGFloat(Self.typeCharacterBudget) * letterWidth
+        let maxCommentWidth = CGFloat(Self.commentCharacterBudget) * Self.textWidth("汉", font: font)
+
+        let rowWidth = model.items.reduce(0) { current, item in
+            let field = min(Self.textWidth(item.label, font: font), maxFieldWidth)
+            let type = min(Self.textWidth(item.detail ?? "", font: font), maxTypeWidth)
+            return max(current, field + type)
+        }
+        let commentWidth = model.items.reduce(0) { current, item in
+            let note = item.inlineNote ?? item.documentation ?? ""
+            return max(current, min(Self.textWidth(note, font: font), maxCommentWidth))
+        }
+
+        let gap = font.charWidth
+        return max(
+            iconWidth + rowWidth + commentWidth + gap * 2
+                + CodeSuggestionLabelView.horizontalPadding * 2,
+            280
         )
-        let textWidth = CGFloat(maxLabelLength) * font.charWidth
-        return max(iconWidth + textWidth + CodeSuggestionLabelView.horizontalPadding * 2, 280)
+    }
+
+    private static func averageLetterWidth(for font: NSFont) -> CGFloat {
+        let sample = letterSample as NSString
+        return sample.size(withAttributes: [.font: font]).width / CGFloat(sample.length)
+    }
+
+    private static func textWidth(_ text: String, font: NSFont) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: font]).width
     }
 
     private var listMaxHeight: CGFloat {

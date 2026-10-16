@@ -129,7 +129,7 @@ final class MongoCompletionService: QueryCompletionService {
 
     private func methodItems(_ methods: [(name: String, detail: String)]) -> [SQLCompletionItem] {
         methods.map {
-            SQLCompletionItem.function($0.name, signature: "()", documentation: $0.detail, caseFolding: .fixed)
+            SQLCompletionItem.function($0.name, signature: "\($0.name)()", documentation: $0.detail, caseFolding: .fixed)
         }
     }
 
@@ -149,7 +149,7 @@ final class MongoCompletionService: QueryCompletionService {
 
     private func constructorItems() -> [SQLCompletionItem] {
         MongoVocabulary.bsonConstructors.map {
-            SQLCompletionItem.function($0.name, signature: "()", documentation: $0.detail, caseFolding: .fixed)
+            SQLCompletionItem.function($0.name, signature: "\($0.name)()", documentation: $0.detail, caseFolding: .fixed)
         }
     }
 

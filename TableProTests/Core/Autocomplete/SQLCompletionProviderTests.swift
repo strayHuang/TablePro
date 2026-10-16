@@ -355,22 +355,22 @@ struct SQLCompletionProviderTests {
 
     // MARK: - P0: CF-4 - Function insertText
 
-    @Test("Function items have closing parentheses in insertText")
+    @Test("Function items carry their parameter skeleton in insertText")
     func testFunctionInsertTextHasParens() async {
         let text = "SELECT COU"
         let (items, _) = await provider.getCompletions(text: text, cursorPosition: text.count)
         let countItem = items.first { $0.label == "COUNT" }
         #expect(countItem != nil)
-        #expect(countItem?.insertText == "COUNT()")
+        #expect(countItem?.insertText == "COUNT(;;expr)")
     }
 
-    @Test("Function items with signature have closing paren")
+    @Test("Function items with signature carry their parameter skeleton in insertText")
     func testFunctionSignatureHasParens() async {
         let text = "SELECT SU"
         let (items, _) = await provider.getCompletions(text: text, cursorPosition: text.count)
         let sumItem = items.first { $0.label == "SUM" }
         #expect(sumItem != nil)
-        #expect(sumItem?.insertText.hasSuffix("()") == true)
+        #expect(sumItem?.insertText == "SUM(;;expr)")
     }
 
     // MARK: - P1: HP-1 - New Clause Type Candidates
@@ -891,10 +891,11 @@ struct SQLCompletionProviderTests {
         #expect(item.documentation?.contains("Default: 0") == true)
     }
 
-    @Test("Column with comment shows comment in documentation")
-    func testColumnCommentInDocs() {
+    @Test("Column with comment carries it as an inline note")
+    func testColumnCommentInline() {
         let item = SQLCompletionItem.column("email", dataType: "VARCHAR(255)", tableName: "users", comment: "User email address")
-        #expect(item.documentation?.contains("User email address") == true)
+        #expect(item.inlineNote == "User email address")
+        #expect(item.documentation?.contains("User email address") != true)
     }
 
     @Test("Column detail combines PK, NOT NULL, and data type")
@@ -1256,6 +1257,49 @@ struct SQLCompletionProviderTests {
         #expect(!items.contains { $0.label.contains("order_total") })
 
         #expect(driver.fetchColumnsCalls == ["users"])
+    }
+
+    // MARK: - Statement start and the DDL object slot
+
+    /// Statement start is the one position every query begins at, so it answers from the keyword
+    /// catalogue whatever else is happening. The tables a connection adds are an extra, never a
+    /// gate: a stalled schema read there used to leave the popup empty and, because the reader's
+    /// next keystroke is turned away while a request is in flight, empty for the rest of the query.
+    @Test("Statement start offers query verbs with nothing typed")
+    func statementStartOffersVerbs() async {
+        await schemaProvider.updateTables([TestFixtures.makeTableInfo(name: "users")])
+        let (items, context) = await provider.getCompletions(text: "", cursorPosition: 0)
+
+        #expect(context.clauseType == .unknown)
+        #expect(items.contains { $0.label == "SELECT" })
+        #expect(items.contains { $0.label == "CREATE" })
+    }
+
+    /// A DDL verb with no object word after it used to fall through to the statement-start list,
+    /// which offered `SELECT` where the reader needed `TABLE`. The object types are the answer here.
+    @Test("A DDL verb offers the object types it can act on", arguments: ["CREATE ", "ALTER ", "DROP "])
+    func ddlVerbOffersObjectTypes(text: String) async {
+        let (items, context) = await provider.getCompletions(text: text, cursorPosition: (text as NSString).length)
+
+        #expect(context.clauseType == .ddlObject)
+        #expect(items.contains { $0.label == "TABLE" })
+        #expect(items.contains { $0.label == "VIEW" })
+        #expect(items.contains { $0.label == "PROCEDURE" })
+    }
+
+    /// The finished statement's columns are not in scope once the caret has stepped past its `;`.
+    /// They were offered there because the terminated statement still answered for the position,
+    /// labelled with the columns of the query the reader had just finished.
+    @Test("A caret just past a terminator offers statement verbs, not the finished query's columns")
+    func caretPastTerminatorOffersStatementVerbs() async {
+        let driver = makeTwoTableDriver()
+        await schemaProvider.loadSchema(using: driver, connection: TestFixtures.makeConnection())
+        let text = "SELECT * FROM users;"
+        let (items, context) = await provider.getCompletions(text: text, cursorPosition: (text as NSString).length)
+
+        #expect(context.clauseType == .unknown)
+        #expect(items.contains { $0.label == "SELECT" })
+        #expect(items.contains { $0.kind == .column } == false)
     }
 
     /// The returned driver has to stay alive for as long as the assertions run.

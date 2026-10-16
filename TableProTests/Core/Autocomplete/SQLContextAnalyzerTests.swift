@@ -1127,4 +1127,70 @@ struct SQLContextAnalyzerTests {
         #expect(context.clauseType == .where_)
         #expect(context.tableReferences.contains { $0.tableName == "users" })
     }
+
+    // MARK: - DDL Object Slot Detection
+
+    /// A DDL verb with no object word after it has nothing more specific to answer than the list of
+    /// objects it can act on. Before this had its own clause those positions fell through to
+    /// `.unknown`, which offered statement verbs instead of `TABLE`, `VIEW`, `INDEX`.
+    @Test("A bare DDL verb asks for the object to act on", arguments: [
+        "CREATE ",
+        "CREATE TEMPORARY ",
+        "CREATE UNIQUE ",
+        "ALTER ",
+        "DROP ",
+    ])
+    func bareDDLVerbAsksForObject(query: String) {
+        let context = analyzer.analyze(query: query, cursorPosition: query.count)
+        #expect(context.clauseType == .ddlObject)
+    }
+
+    /// The object word names what comes next: a table. `.dropObject` is the clause that offers the
+    /// table list, and it is reached here because the name has not been typed yet.
+    @Test("A DDL object word with no name yet asks for the name", arguments: [
+        "ALTER TABLE ",
+        "TRUNCATE ",
+        "TRUNCATE TABLE ",
+    ])
+    func ddlObjectWordWithNoNameAsksForTheName(query: String) {
+        let context = analyzer.analyze(query: query, cursorPosition: query.count)
+        #expect(context.clauseType == .dropObject)
+    }
+
+    /// Once the name is in, `ALTER TABLE users ` is a table alteration, and its column verbs are the
+    /// candidates. The new pattern must not take this position away from `.alterTable`.
+    @Test("A named ALTER TABLE is still an alter, not an object list")
+    func namedAlterTableStaysAlter() {
+        let query = "ALTER TABLE users "
+        let context = analyzer.analyze(query: query, cursorPosition: query.count)
+        #expect(context.clauseType == .alterTable)
+    }
+
+    // MARK: - Statement Terminator Boundary
+
+    /// A caret resting just past the `;` has stepped into the next statement rather than stayed on
+    /// the one it finished. The finished statement answered with its own clauses, so a name typed
+    /// there was offered the columns of the query behind it instead of the verbs a new statement
+    /// starts with. The columns of that finished statement must not be in scope either.
+    @Test("A caret just past a terminator starts a new statement", arguments: [
+        "SELECT * FROM users;",
+        "SELECT * FROM users; ",
+        "SELECT * FROM users;\n",
+    ])
+    func caretPastTerminatorStartsANewStatement(query: String) {
+        let context = analyzer.analyze(query: query, cursorPosition: (query as NSString).length)
+        #expect(context.clauseType == .unknown)
+        #expect(context.prefix.isEmpty)
+        #expect(context.tableReferences.isEmpty)
+    }
+
+    /// The same position one character earlier is still inside the statement, so its clause and its
+    /// tables are in scope. The boundary is the terminator, not the last typed word.
+    @Test("A caret before the terminator stays in the statement")
+    func caretBeforeTerminatorStaysInStatement() {
+        let query = "SELECT * FROM users;"
+        let context = analyzer.analyze(query: query, cursorPosition: (query as NSString).length - 1)
+        #expect(context.clauseType == .from)
+        #expect(context.tableReferences.contains { $0.tableName == "users" })
+    }
 }

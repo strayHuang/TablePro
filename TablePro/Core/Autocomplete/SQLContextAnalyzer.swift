@@ -47,6 +47,7 @@ enum SQLClauseType {
     case using            // After USING (JOIN ... USING)
     case window           // After OVER/PARTITION BY/window clause
     case dropObject       // After DROP TABLE/INDEX/VIEW
+    case ddlObject        // After a bare CREATE/ALTER/DROP, choosing the object to act on
     case createIndex      // After CREATE INDEX
     case createView       // After CREATE VIEW
     case castTarget       // After a PostgreSQL :: cast operator
@@ -95,6 +96,9 @@ struct SQLContext {
     let isAfterComma: Bool          // True if immediately after a comma
     let expectsObjectName: Bool     // Cursor is in the table-operand slot of FROM/JOIN/INTO
     let comparisonColumn: String?   // Column being compared against, when the cursor is on the value side
+    /// True when this is an `AND`/`OR` whose governing clause is a JOIN `ON`, so the
+    /// join-condition completions belong here too. The clause stays `.and` either way.
+    let andContinuesJoin: Bool
 
     init(
         clauseType: SQLClauseType,
@@ -109,7 +113,8 @@ struct SQLContext {
         currentFunction: String? = nil,
         isAfterComma: Bool = false,
         expectsObjectName: Bool = false,
-        comparisonColumn: String? = nil
+        comparisonColumn: String? = nil,
+        andContinuesJoin: Bool = false
     ) {
         self.clauseType = clauseType
         self.prefix = prefix
@@ -124,6 +129,7 @@ struct SQLContext {
         self.isAfterComma = isAfterComma
         self.expectsObjectName = expectsObjectName
         self.comparisonColumn = comparisonColumn
+        self.andContinuesJoin = andContinuesJoin
     }
 
     func replacingTableReferences(_ references: [TableReference]) -> SQLContext {
@@ -140,7 +146,8 @@ struct SQLContext {
             currentFunction: currentFunction,
             isAfterComma: isAfterComma,
             expectsObjectName: expectsObjectName,
-            comparisonColumn: comparisonColumn
+            comparisonColumn: comparisonColumn,
+            andContinuesJoin: andContinuesJoin
         )
     }
 
@@ -211,6 +218,15 @@ final class SQLContextAnalyzer {
             ("\\bCREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+[^;]*\\([^)]*\\)\\s*\\w*$", .createTable),
             ("\\bCREATE\\s+(?:TEMPORARY\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?\\w*$", .createTable),
             ("\\bDROP\\s+(?:TABLE|VIEW|INDEX)\\s+(?:IF\\s+EXISTS\\s+)?\\w*$", .dropObject),
+            // A DDL statement whose object word has been written but its name has not: the object
+            // list is the right answer, and the bare-keyword patterns above cannot see it.
+            ("\\bALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?[`\"']?\\w*[`\"']?\\s*$", .dropObject),
+            ("\\bTRUNCATE\\s+(?:TABLE\\s+)?[`\"']?\\w*[`\"']?\\s*$", .dropObject),
+            // A bare DDL verb whose object has not been named yet: what the cursor wants is the
+            // list of object types. Tried after the object-word patterns above, so `CREATE TABLE `
+            // and `ALTER TABLE ` keep the clauses they start.
+            ("\\b(?:CREATE|ALTER|DROP)(?:\\s+(?:OR\\s+REPLACE|TEMPORARY|UNIQUE|MATERIALIZED|CONCURRENTLY|IF\\s+NOT\\s+EXISTS))*\\s*$",
+             .ddlObject),
             ("\\bCREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+\\w+\\s+ON\\s+\\w+\\s*\\([^)]*$", .createIndex),
             ("\\bCREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+\\w*$", .createIndex),
             ("\\bCREATE\\s+(?:OR\\s+REPLACE\\s+)?(?:MATERIALIZED\\s+)?VIEW\\s+\\w+\\s+AS\\s+[^;]*$",
@@ -297,6 +313,24 @@ final class SQLContextAnalyzer {
         let adjustedPosition = safePosition - statementOffset
 
         let nsStatement = currentStatement as NSString
+
+        // A caret resting exactly past the statement's `;` has not finished that statement, it has
+        // stepped into the next one. The terminated text as a whole answered with the completed
+        // query's clauses, which is why a name typed after a `;` was offered the columns of the
+        // query behind it instead of the keyword list the statement should start with.
+        if adjustedPosition >= nsStatement.length,
+           currentStatement.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(";") {
+            return SQLContext(
+                clauseType: .unknown,
+                prefix: "",
+                prefixRange: safePosition..<safePosition,
+                dotPrefix: nil,
+                tableReferences: [],
+                isInsideString: false,
+                isInsideComment: false
+            )
+        }
+
         let clampedPosition = max(0, min(adjustedPosition, nsStatement.length))
         let textBeforeCursor = nsStatement.substring(to: clampedPosition)
 
@@ -388,7 +422,8 @@ final class SQLContextAnalyzer {
             currentFunction: currentFunction,
             isAfterComma: isAfterComma,
             expectsObjectName: resolution.expectsObjectName,
-            comparisonColumn: comparisonColumn
+            comparisonColumn: comparisonColumn,
+            andContinuesJoin: resolution.andContinuesJoin
         )
     }
 
@@ -968,6 +1003,14 @@ final class SQLContextAnalyzer {
     private struct ClauseResolution {
         let clause: SQLClauseType
         let expectsObjectName: Bool
+        /// See `SQLContext.andContinuesJoin`. Only ever set for an `.and` resolution.
+        let andContinuesJoin: Bool
+
+        init(clause: SQLClauseType, expectsObjectName: Bool, andContinuesJoin: Bool = false) {
+            self.clause = clause
+            self.expectsObjectName = expectsObjectName
+            self.andContinuesJoin = andContinuesJoin
+        }
     }
 
     /// Determine the clause type based on text before cursor
@@ -1047,6 +1090,9 @@ final class SQLContextAnalyzer {
         var pendingEnd = 0
         var sawObject = false
         var slotClosed = false
+        /// Set once an `AND`/`OR` is seen, so the clause behind it decides whether the
+        /// cursor is still inside a join condition. The clause returned stays `.and`.
+        var pendingLogical = false
 
         for index in stride(from: tokens.count - 1, through: 0, by: -1) {
             let token = tokens[index]
@@ -1078,15 +1124,33 @@ final class SQLContextAnalyzer {
                     return ClauseResolution(clause: .caseExpression, expectsObjectName: false)
                 }
                 guard pendingEnd == 0 else { continue }
+                // `AND`/`OR` opens an operand slot whose clause is whichever one governs
+                // it. Scan past it so a JOIN `ON` is recognised, but still answer `.and`:
+                // the completions belong to the continuation, not to `ON` or `WHERE`.
+                if word == "AND" || word == "OR" {
+                    pendingLogical = true
+                    continue
+                }
                 let previous = index > 0 ? tokens[index - 1].upper : nil
                 if let clause = clause(forKeyword: word, previous: previous, sawObject: sawObject) {
+                    if pendingLogical {
+                        return ClauseResolution(
+                            clause: .and,
+                            expectsObjectName: false,
+                            andContinuesJoin: clause.clause == .on
+                        )
+                    }
                     return clause
                 }
                 if !slotClosed { sawObject = true }
             }
         }
 
-        return nil
+        // An `AND`/`OR` with no governing clause keyword behind it (e.g. an expression
+        // list) still resolves to `.and`, as it did before.
+        return pendingLogical
+            ? ClauseResolution(clause: .and, expectsObjectName: false)
+            : nil
     }
 
     /// Map a clause-introducing keyword to its clause. `sawObject` is true when a
@@ -1109,8 +1173,6 @@ final class SQLContextAnalyzer {
             return ClauseResolution(clause: .on, expectsObjectName: false)
         case "WHERE":
             return ClauseResolution(clause: .where_, expectsObjectName: false)
-        case "AND", "OR":
-            return ClauseResolution(clause: .and, expectsObjectName: false)
         case "HAVING":
             return ClauseResolution(clause: .having, expectsObjectName: false)
         case "SET":

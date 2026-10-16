@@ -14,6 +14,11 @@ public protocol CodeSuggestionEntry {
     var detail: String? { get }
     var documentation: String? { get }
 
+    /// A short note shown inline at the trailing edge of the row, beside the label and detail.
+    /// Carry a table's or column's comment here so it reads at a glance, rather than only in the
+    /// preview pane below the list.
+    var inlineNote: String? { get }
+
     /// Leave as `nil` if the link is in the same document.
     var pathComponents: [String]? { get }
     var targetPosition: CursorPosition? { get }
@@ -29,5 +34,6 @@ public protocol CodeSuggestionEntry {
 }
 
 public extension CodeSuggestionEntry {
+    var inlineNote: String? { nil }
     var matchedRanges: [Range<Int>] { [] }
 }

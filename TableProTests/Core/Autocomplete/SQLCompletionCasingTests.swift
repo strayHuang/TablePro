@@ -37,21 +37,24 @@ struct SQLCompletionCasingTests {
         #expect(item.insertText == "SELECT")
     }
 
-    @Test("A lowercase prefix completes to a lowercase function, parentheses included")
+    /// The case follows the typed prefix through the whole skeleton, the parameter names included,
+    /// so what the preview lists and what accept writes never disagree.
+    @Test("A lowercase prefix completes to a lowercase function, its parameters included")
     func lowercaseFunction() {
-        let items = applied([SQLCompletionItem.function("COUNT", signature: "COUNT(expr)")], "cou")
+        let items = applied([SQLCompletionItem.function("COUNT", signature: "COUNT(;;expr)")], "cou")
         #expect(items[0].label == "count")
-        #expect(items[0].insertText == "count()")
+        #expect(items[0].insertText == "count(;;expr)")
 
         let resolution = SQLCompletionInsertion.resolve(for: items[0])
-        #expect(resolution.text == "count()")
+        #expect(resolution.text == "count(expr)")
         #expect(resolution.cursorOffset == 6)
+        #expect(resolution.stops == [SQLCompletionInsertion.Stop(offset: 6, length: 4)])
     }
 
     @Test("An uppercase prefix completes to an uppercase function")
     func uppercaseFunction() {
-        let items = applied([SQLCompletionItem.function("COUNT", signature: "COUNT(expr)")], "COU")
-        #expect(items[0].insertText == "COUNT()")
+        let items = applied([SQLCompletionItem.function("COUNT", signature: "COUNT(;;expr)")], "COU")
+        #expect(items[0].insertText == "COUNT(;;EXPR)")
     }
 
     // MARK: - How the case is read off the prefix
@@ -171,7 +174,7 @@ struct SQLCompletionCasingTests {
 
     @Test("A function a dialect declares case-sensitive keeps its spelling")
     func caseSensitiveDialectFunction() {
-        let item = SQLCompletionItem.function("toString", signature: "toString(…)", caseFolding: .fixed)
+        let item = SQLCompletionItem.function("toString", signature: "toString()", caseFolding: .fixed)
         #expect(applied([item], "tos")[0].insertText == "toString()")
         #expect(applied([item], "TOS")[0].insertText == "toString()")
     }
@@ -180,7 +183,7 @@ struct SQLCompletionCasingTests {
 
     @Test("The label and the inserted text never disagree")
     func labelAndInsertTextAgree() {
-        let items = SQLKeywords.keywordItems() + SQLKeywords.functionItems()
+        let items = SQLKeywords.keywordItems() + SQLKeywords.functionItems(for: nil)
         for prefix in ["a", "A", "", "_"] {
             for item in applied(items, prefix) where item.insertText.hasSuffix("()") {
                 #expect(item.insertText == item.label + "()")
@@ -285,11 +288,14 @@ struct SQLCompletionCasingTests {
         return context?.items.map(\.insertText) ?? []
     }
 
+    /// The name is deliberately one the built-in catalogue does not carry: a catalogue entry
+    /// supplies its own skeleton and wins the dedup, so the dialect's own spelling is only
+    /// measurable on a function the dialect alone declares.
     @Test("A dialect whose function names are case-insensitive follows the typed case")
     func caseInsensitiveDialectFunctionsFollowTheTypedCase() async {
-        let descriptor = dialect(functions: ["STRING_AGG"], functionNamesAreCaseInsensitive: true)
-        #expect(await inserted("SELECT string_a", dialect: descriptor).contains("string_agg()"))
-        #expect(await inserted("SELECT STRING_A", dialect: descriptor).contains("STRING_AGG()"))
+        let descriptor = dialect(functions: ["MEDIAN_AGG"], functionNamesAreCaseInsensitive: true)
+        #expect(await inserted("SELECT median_a", dialect: descriptor).contains("median_agg()"))
+        #expect(await inserted("SELECT MEDIAN_A", dialect: descriptor).contains("MEDIAN_AGG()"))
     }
 
     /// Measured on ClickHouse 26.9.1.52: `toString` and `uniq` are rejected as UNKNOWN_FUNCTION in

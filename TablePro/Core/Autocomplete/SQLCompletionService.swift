@@ -63,8 +63,21 @@ final class SQLCompletionService: QueryCompletionService {
     func completions(in text: NSString, at offset: Int, isManualTrigger: Bool) async -> QueryCompletionSession? {
         guard !suppressesAfterStatementBreak(in: text, at: offset) else { return nil }
 
-        let windowStart = max(0, offset - Self.windowRadius)
+        var windowStart = max(0, offset - Self.windowRadius)
         let windowEnd = min(text.length, offset + Self.windowRadius)
+
+        // Move the window's left edge up to the statement boundary when there is one, so the
+        // analyzer reads the caret's statement from its first word. A plain radius would hand a
+        // caret far into a long document the tail of its statement, with no clause keyword left in
+        // view, and the `;` of an earlier statement cut off so its tables still read as in scope.
+        if windowStart > 0 {
+            let searchRange = NSRange(location: windowStart, length: offset - windowStart)
+            let boundary = text.range(of: ";", options: .backwards, range: searchRange)
+            if boundary.location != NSNotFound {
+                windowStart = boundary.location + 1
+            }
+        }
+
         let window = text.substring(with: NSRange(location: windowStart, length: windowEnd - windowStart))
 
         guard let context = await engine.getCompletions(

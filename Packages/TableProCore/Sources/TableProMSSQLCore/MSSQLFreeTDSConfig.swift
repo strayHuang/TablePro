@@ -24,9 +24,12 @@ public enum MSSQLCertificateVerification: Equatable, Sendable {
 
 /// The `encryption` values libtds reads, which decide what the client offers in the TDS prelogin.
 ///
-/// libtds also takes `off`, which tells the server the client cannot encrypt at all. It is left out: the password then
-/// crosses the network in the clear, and a server that forces encryption drops the connection.
+/// `off` is offered for legacy servers whose TLS stack cannot interoperate with modern clients (for example a
+/// SQL Server 2012 RTM instance that only speaks TLS 1.0): the password then crosses the network in the clear,
+/// and a server that forces encryption drops the connection.
 public enum MSSQLEncryptionLevel: String, CaseIterable, Equatable, Sendable {
+    /// Plain TCP: the client tells the server it cannot encrypt at all.
+    case off
     /// Encrypts the login, and the rest of the session only when the server forces encryption.
     case request
     /// Encrypts the whole session, and fails against a server that cannot.

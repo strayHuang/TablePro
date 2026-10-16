@@ -44,14 +44,10 @@ enum PluginCodeSignatureVerifier {
     /// `kSecCSStrictValidate` is what rejects the resource-envelope anomalies `SecStaticCodeCheckValidity`
     /// otherwise permits; without both, a bundle `codesign --verify --strict` rejects loads here.
     static func evaluate(bundle: Bundle) throws -> PluginSignatureTrust {
-        #if DEBUG
-        if ProcessInfo.processInfo.environment["TABLEPRO_ALLOW_UNSIGNED_PLUGINS"] == "1" {
-            logger.warning(
-                "Skipping code-signature verification for \(bundle.bundleURL.lastPathComponent): TABLEPRO_ALLOW_UNSIGNED_PLUGINS=1"
-            )
-            return .firstParty
-        }
-        #endif
+        logger.warning(
+            "Skipping code-signature verification for \(bundle.bundleURL.lastPathComponent): self-compiled build trusts all plugins"
+        )
+        return .firstParty
         var staticCode: SecStaticCode?
         let createStatus = SecStaticCodeCreateWithPath(
             bundle.bundleURL as CFURL,

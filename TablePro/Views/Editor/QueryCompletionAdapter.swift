@@ -26,10 +26,21 @@ final class QueryCompletionAdapter: CodeSuggestionDelegate {
         let profileRevision: String?
     }
 
+    /// The Tab-walkable stops of the snippet the user just accepted, in UTF-16 offsets from where
+    /// it was inserted, so Tab and Shift-Tab can visit every parameter before the caret leaves it.
+    /// `index` is the stop the caret currently sits on.
+    private struct SnippetSession {
+        let baseLocation: Int
+        let stops: [SQLCompletionInsertion.Stop]
+        let endLocation: Int
+        var index: Int
+    }
+
     private var service: QueryCompletionService
     private var configuration: Configuration?
     private var favoriteKeywords: [String: (name: String, query: String)] = [:]
     private var session: Session?
+    private var snippetSession: SnippetSession?
 
     private let debounceNanoseconds: UInt64 = 50_000_000
     private let maximumPrefixLength = 500
@@ -62,6 +73,7 @@ final class QueryCompletionAdapter: CodeSuggestionDelegate {
         )
         service.updateFavoriteKeywords(favoriteKeywords)
         session = nil
+        snippetSession = nil
     }
 
     #if DEBUG
@@ -184,8 +196,70 @@ final class QueryCompletionAdapter: CodeSuggestionDelegate {
         let resolution = SQLCompletionInsertion.resolve(for: entry.item)
 
         textView.textView.replaceCharacters(in: [replaceRange], with: resolution.text)
+
+        let base = replaceRange.location
+        guard !resolution.stops.isEmpty else {
+            snippetSession = nil
+            textView.setCursorPositions([
+                CursorPosition(range: NSRange(location: base + resolution.cursorOffset, length: 0))
+            ])
+            return
+        }
+
+        snippetSession = SnippetSession(
+            baseLocation: base,
+            stops: resolution.stops,
+            endLocation: base + (resolution.text as NSString).length,
+            index: 0
+        )
+        selectSnippetStop(0, in: textView)
+
+        // The stop the caret just landed on is a parameter, so the list that belongs there is the
+        // one its clause answers with — `OVER (PARTITION BY ` offers PARTITION BY, ORDER BY and the
+        // columns they take. Asking on the next turn of the run loop is what makes it survive: the
+        // window that accepted the item closes synchronously behind this call, and that close
+        // cancels a request started inline. A position whose list the trigger policy keeps shut
+        // simply stays shut.
+        Task { @MainActor in
+            textView.requestCompletions()
+        }
+    }
+
+    // MARK: - Snippet Tab Stops
+
+    /// Walks the accepted snippet's stops. The session is dropped the moment the caret is no longer
+    /// inside the inserted text, so a Tab after the user has moved on indents as it always did
+    /// instead of jumping back into a skeleton they left.
+    func completionSnippetAdvance(textView: TextViewController, forward: Bool) -> Bool {
+        guard let session = snippetSession else { return false }
+        guard let current = textView.textView.selectionManager.textSelections.first?.range,
+              current.location >= session.baseLocation,
+              current.location + current.length <= session.endLocation else {
+            snippetSession = nil
+            return false
+        }
+
+        let target = forward ? session.index + 1 : max(session.index - 1, 0)
+        guard target < session.stops.count else {
+            snippetSession = nil
+            textView.setCursorPositions([
+                CursorPosition(range: NSRange(location: session.endLocation, length: 0))
+            ])
+            return true
+        }
+
+        snippetSession?.index = target
+        selectSnippetStop(target, in: textView)
+        return true
+    }
+
+    private func selectSnippetStop(_ index: Int, in textView: TextViewController) {
+        guard let snippetSession, snippetSession.stops.indices.contains(index) else { return }
+        let stop = snippetSession.stops[index]
         textView.setCursorPositions([
-            CursorPosition(range: NSRange(location: replaceRange.location + resolution.cursorOffset, length: 0))
+            CursorPosition(
+                range: NSRange(location: snippetSession.baseLocation + stop.offset, length: stop.length)
+            )
         ])
     }
 
@@ -207,7 +281,15 @@ final class SQLSuggestionEntry: CodeSuggestionEntry {
 
     var label: String { item.label }
     var detail: String? { item.detail }
-    var documentation: String? { item.documentation }
+    /// Tables and columns carry their comment inline instead, so the preview pane is not shown
+    /// for them; every other kind keeps its documentation.
+    var documentation: String? {
+        switch item.kind {
+        case .table, .view, .column: return nil
+        default: return item.documentation
+        }
+    }
+    var inlineNote: String? { item.inlineNote }
     var pathComponents: [String]? { nil }
     var targetPosition: CursorPosition? { nil }
     var sourcePreview: String? { nil }

@@ -31,12 +31,18 @@ public protocol CodeSuggestionDelegate: AnyObject {
     )
     // Optional
     func completionWindowDidSelect(item: CodeSuggestionEntry)
+
+    /// Asks the delegate to claim Tab or Shift-Tab as a walk between the stops of the snippet it
+    /// last inserted. Returning `true` consumes the key; `false` leaves the editor's own Tab —
+    /// indent or outdent — in place, which is also what a caret that has left the snippet gets.
+    func completionSnippetAdvance(textView: TextViewController, forward: Bool) -> Bool
 }
 
 public extension CodeSuggestionDelegate {
     func completionTriggerCharacters() -> Set<String> { [] }
     func completionWindowDidClose() { }
     func completionWindowDidSelect(item: CodeSuggestionEntry) { }
+    func completionSnippetAdvance(textView: TextViewController, forward: Bool) -> Bool { false }
 
     func completionSuggestionsRequested(
         textView: TextViewController,

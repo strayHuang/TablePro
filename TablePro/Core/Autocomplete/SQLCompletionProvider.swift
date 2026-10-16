@@ -99,7 +99,7 @@ final class SQLCompletionProvider {
             return ([], [], context)
         }
 
-        var candidates = await getCandidates(for: context)
+        var candidates = await getCandidates(for: context, text: text)
 
         if !context.prefix.isEmpty {
             candidates = filterByPrefix(candidates, prefix: context.prefix)
@@ -136,13 +136,13 @@ final class SQLCompletionProvider {
     /// Cached per dialect; invalidated in `setDatabaseType`.
     private func functionItems() -> [SQLCompletionItem] {
         if let cachedFunctionItems { return cachedFunctionItems }
-        var items = SQLKeywords.functionItems()
+        var items = SQLKeywords.functionItems(for: databaseType.flatMap(SQLKeywords.SQLFunctionDialect.engine(for:)))
         if let dialect = cachedDialect, !dialect.functions.isEmpty {
             let folding: SQLCompletionCaseFolding =
                 dialect.functionNamesAreCaseInsensitive ? .caseInsensitive : .fixed
             var seen = Set(items.map { $0.label.uppercased() })
             for name in dialect.functions.sorted() where seen.insert(name.uppercased()).inserted {
-                items.append(SQLCompletionItem.function(name, signature: "\(name)(…)", caseFolding: folding))
+                items.append(SQLCompletionItem.function(name, signature: "\(name)()", caseFolding: folding))
             }
         }
         cachedFunctionItems = items
@@ -151,9 +151,11 @@ final class SQLCompletionProvider {
 
     // MARK: - Candidate Generation
 
-    /// Get candidate completions based on context
+    /// Get candidate completions based on context. `text` is the analyzed statement, read to
+    /// skip join conditions already written and to scope them to the tables this statement names.
     private func getCandidates( // swiftlint:disable:this function_body_length
-        for context: SQLContext
+        for context: SQLContext,
+        text: String
     ) async -> [SQLCompletionItem] {
         var items: [SQLCompletionItem] = []
 
@@ -254,11 +256,15 @@ final class SQLCompletionProvider {
                 items += functionItems()
                 items += filterKeywords([
                     "DISTINCT", "ALL", "AS", "FROM", "CASE", "WHEN",
-                    "INTO", "UNION", "INTERSECT", "EXCEPT"
+                    "INTO", "UNION", "INTERSECT", "EXCEPT", "OVER"
                 ])
             }
 
         case .on:
+            // Whole join conditions (`t1.col = t2.col`), inferred from foreign keys and column
+            // metadata, lead the list. The single columns below stay, so a half-written condition
+            // can still be finished one name at a time.
+            items += await joinConditionItems(for: context, text: text)
             items += await allowedValueItems(for: context)
             // HP-3: ON clause — prioritize columns from joined tables
             items += await columnItems(for: context.tableReferences)
@@ -294,6 +300,10 @@ final class SQLCompletionProvider {
 
         case .where_, .and, .having:
             // HP-8: Columns, operators, logical keywords + clause transitions
+            // An `AND`/`OR` that continues an `ON` can still take another join condition.
+            if context.andContinuesJoin {
+                items += await joinConditionItems(for: context, text: text)
+            }
             items += await allowedValueItems(for: context)
             items += await columnItems(for: context.tableReferences)
             items += SQLKeywords.operatorItems()
@@ -306,14 +316,14 @@ final class SQLCompletionProvider {
             ])
             items += functionItems()
             items += filterKeywords([
-                "ORDER BY", "GROUP BY", "HAVING", "LIMIT",
+                "ORDER BY", "GROUP BY", "HAVING", "LIMIT", "OVER",
                 "UNION", "INTERSECT", "EXCEPT"
             ])
 
         case .groupBy:
             items += await columnItems(for: context.tableReferences)
             items += filterKeywords([
-                "HAVING", "ORDER BY", "LIMIT",
+                "HAVING", "ORDER BY", "LIMIT", "OVER",
                 "UNION", "INTERSECT", "EXCEPT"
             ])
 
@@ -321,7 +331,7 @@ final class SQLCompletionProvider {
             items += await columnItems(for: context.tableReferences)
             items += filterKeywords([
                 "ASC", "DESC", "NULLS FIRST", "NULLS LAST",
-                "LIMIT", "OFFSET",
+                "LIMIT", "OFFSET", "OVER",
                 "UNION", "INTERSECT", "EXCEPT"
             ])
 
@@ -448,7 +458,7 @@ final class SQLCompletionProvider {
         case .window:
             items += await columnItems(for: context.tableReferences)
             items += filterKeywords([
-                "PARTITION BY", "ORDER BY", "ASC", "DESC",
+                "PARTITION BY", "ORDER BY", "ASC", "DESC", "OVER",
                 "ROWS", "RANGE", "GROUPS", "BETWEEN", "UNBOUNDED",
                 "PRECEDING", "FOLLOWING", "CURRENT ROW"
             ])
@@ -474,8 +484,26 @@ final class SQLCompletionProvider {
             items = castTargetCompletionItems()
 
         case .unknown:
+            // Statement start answers from the keyword catalogue first, and the tables are an
+            // addition asked for on a deadline rather than awaited. The schema read used to gate
+            // the keywords, so a slow one emptied the popup at the one position a reader always
+            // types into — and, because the reader's next keystroke is dropped while a request is
+            // in flight, left it empty for the rest of the query too.
             items = statementStartCompletionItems()
-            items += await schemaProvider?.tableCompletionItems() ?? []
+            if let schemaProvider {
+                items += await withCompletionDeadline(
+                    seconds: SQLSchemaProvider.readDeadlineSeconds,
+                    fallback: [SQLCompletionItem](),
+                    operation: { await schemaProvider.tableCompletionItems() }
+                )
+            }
+
+        case .ddlObject:
+            items = filterKeywords([
+                "TABLE", "VIEW", "INDEX", "DATABASE", "SCHEMA", "SEQUENCE",
+                "PROCEDURE", "FUNCTION", "TRIGGER",
+                "IF NOT EXISTS", "IF EXISTS", "OR REPLACE", "UNIQUE", "TEMPORARY"
+            ])
         }
 
         items += favoriteCompletions(matching: context.prefix)
@@ -578,12 +606,47 @@ final class SQLCompletionProvider {
         }
     }
 
-    /// Columns from explicit table references, or all cached schema columns as fallback
+    /// Columns of the tables this statement names, and none when it names no table. The whole-cache
+    /// fallback that used to answer a table-less statement offered every column the cache held,
+    /// labelled with the table it came from, which read as another query's columns leaking in.
     private func columnItems(for references: [TableReference]) async -> [SQLCompletionItem] {
-        if references.isEmpty {
-            return await schemaProvider?.allColumnsFromCachedTables() ?? []
-        }
+        guard !references.isEmpty else { return [] }
         return await schemaProvider?.allColumnsInScope(for: references) ?? []
+    }
+
+    /// Whole join conditions (`t1.col = t2.col`) relating the statement's tables, inferred from
+    /// foreign keys and column name/type metadata. Columns and foreign keys both come from the
+    /// schema provider's caches, and pairs the statement already wrote are skipped.
+    private func joinConditionItems(for context: SQLContext, text: String) async -> [SQLCompletionItem] {
+        guard context.tableReferences.count > 1, let schemaProvider else { return [] }
+
+        var tables: [JoinConditionProvider.Table] = []
+        for ref in context.tableReferences where !ref.isDerived {
+            let columns = await schemaProvider.getColumns(for: ref.tableName, schema: ref.schema)
+            let keys = await schemaProvider.getForeignKeys(for: ref.tableName, schema: ref.schema)
+            tables.append(
+                JoinConditionProvider.Table(
+                    identifier: ref.alias ?? ref.tableName,
+                    tableName: ref.tableName,
+                    columns: columns.map {
+                        JoinConditionProvider.Column(
+                            name: $0.name, typeName: $0.dataType, isPrimaryKey: $0.isPrimaryKey
+                        )
+                    },
+                    foreignKeys: keys.map {
+                        JoinConditionProvider.ForeignKey(
+                            column: $0.column,
+                            referencedTable: $0.referencedTable,
+                            referencedColumn: $0.referencedColumn
+                        )
+                    }
+                )
+            )
+        }
+
+        return JoinConditionProvider.items(
+            for: tables, excluding: JoinConditionProvider.usedConditionKeys(in: text)
+        )
     }
 
     /// Filter to specific keywords
@@ -660,7 +723,8 @@ final class SQLCompletionProvider {
             } else if let containsRange = optionalRange(of: lowerPrefix, in: nsFilterText) {
                 item.matchedRanges = [containsRange]
                 item.fuzzyPenalty = 0
-            } else if let resolution = resolveFuzzyMatch(pattern: lowerPrefix, target: item.filterText) {
+            } else if item.allowsFuzzyMatch,
+                      let resolution = resolveFuzzyMatch(pattern: lowerPrefix, target: item.filterText) {
                 item.matchedRanges = indicesToRanges(resolution.indices)
                 item.fuzzyPenalty = resolution.penalty
             } else {
@@ -830,5 +894,28 @@ final class SQLCompletionProvider {
         score += (item.label as NSString).length
 
         return score
+    }
+}
+
+extension SQLKeywords.SQLFunctionDialect {
+    /// The catalogue flag a connection's engine answers to, or `nil` for an engine the table
+    /// doesn't model. `nil` keeps the whole list rather than an arbitrary subset of it, which is
+    /// the safe direction: a wrong tag hides a function the engine does support, and the point of
+    /// the filter is to stop offering ones it doesn't.
+    static func engine(for databaseType: DatabaseType) -> SQLKeywords.SQLFunctionDialect? {
+        switch databaseType {
+        case .mysql, .mariadb, .tidb, .databend, .oceanbase:
+            return .mysql
+        case .postgresql, .redshift, .cockroachdb:
+            return .postgres
+        case .mssql:
+            return .mssql
+        case .oracle, .dameng:
+            return .oracle
+        case .sqlite, .libsql, .turso, .cloudflareD1:
+            return .sqlite
+        default:
+            return nil
+        }
     }
 }

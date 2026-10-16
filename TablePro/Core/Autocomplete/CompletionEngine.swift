@@ -168,7 +168,9 @@ final class CompletionEngine {
             nestingLevel: context.nestingLevel,
             currentFunction: context.currentFunction,
             isAfterComma: context.isAfterComma,
-            expectsObjectName: context.expectsObjectName
+            expectsObjectName: context.expectsObjectName,
+            comparisonColumn: context.comparisonColumn,
+            andContinuesJoin: context.andContinuesJoin
         )
 
         return CompletionContext(

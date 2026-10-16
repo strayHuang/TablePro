@@ -53,7 +53,7 @@ final class MSSQLSchemaQueriesTests: XCTestCase {
         let sql = MSSQLSchemaQueries.tables(in: .schema("sales"))
         XCTAssertEqual(sql, MSSQLSchemaQueries.tables(schema: "sales"))
         XCTAssertTrue(sql.contains("WHERE t.TABLE_SCHEMA = N'sales'"))
-        XCTAssertTrue(sql.hasPrefix("SELECT t.TABLE_NAME, t.TABLE_TYPE\n"))
+        XCTAssertTrue(sql.hasPrefix("SELECT t.TABLE_NAME, t.TABLE_TYPE, t.TABLE_SCHEMA,\n"))
         XCTAssertTrue(sql.hasSuffix("ORDER BY t.TABLE_NAME"))
         XCTAssertFalse(sql.contains("INFORMATION_SCHEMA.SCHEMATA"))
     }
@@ -65,7 +65,7 @@ final class MSSQLSchemaQueriesTests: XCTestCase {
         let sql = MSSQLSchemaQueries.tables(in: .allSchemas)
         XCTAssertTrue(sql.contains("WHERE t.TABLE_SCHEMA IN (\n\(MSSQLSchemaQueries.listedSchemaNames)\n)"))
         XCTAssertFalse(sql.contains("ORDER BY SCHEMA_NAME"))
-        XCTAssertTrue(sql.hasPrefix("SELECT t.TABLE_NAME, t.TABLE_TYPE, t.TABLE_SCHEMA\n"))
+        XCTAssertTrue(sql.hasPrefix("SELECT t.TABLE_NAME, t.TABLE_TYPE, t.TABLE_SCHEMA,\n"))
         XCTAssertTrue(sql.contains("AND t.TABLE_TYPE IN ('BASE TABLE', 'VIEW')"))
         XCTAssertTrue(sql.hasSuffix("ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME"))
     }
@@ -74,7 +74,7 @@ final class MSSQLSchemaQueriesTests: XCTestCase {
         let sql = MSSQLSchemaQueries.tables(in: .schemas(["sales", "dbo"]))
         XCTAssertTrue(sql.contains("WHERE t.TABLE_SCHEMA IN (N'sales', N'dbo')\n"))
         XCTAssertFalse(sql.contains("INFORMATION_SCHEMA.SCHEMATA"))
-        XCTAssertTrue(sql.hasPrefix("SELECT t.TABLE_NAME, t.TABLE_TYPE, t.TABLE_SCHEMA\n"))
+        XCTAssertTrue(sql.hasPrefix("SELECT t.TABLE_NAME, t.TABLE_TYPE, t.TABLE_SCHEMA,\n"))
         XCTAssertTrue(sql.contains("AND t.TABLE_TYPE IN ('BASE TABLE', 'VIEW')"))
         XCTAssertTrue(sql.hasSuffix("ORDER BY t.TABLE_SCHEMA, t.TABLE_NAME"))
     }
@@ -127,9 +127,9 @@ final class MSSQLSchemaQueriesTests: XCTestCase {
 
     func testAllColumnsQueryCarriesTheTableNameAfterTheParsedColumns() {
         let sql = MSSQLSchemaQueries.allColumns(schema: "dbo")
-        XCTAssertTrue(sql.contains("AS IS_SERVER_GENERATED,\n    c.TABLE_NAME"))
+        XCTAssertTrue(sql.contains("AS COLUMN_COMMENT,\n    c.TABLE_NAME"))
         XCTAssertTrue(sql.contains("c.TABLE_SCHEMA = N'dbo'"))
-        XCTAssertEqual(MSSQLSchemaQueries.allColumnsTableNameIndex, 11)
+        XCTAssertEqual(MSSQLSchemaQueries.allColumnsTableNameIndex, 12)
     }
 
     func testParseColumnRowReadsServerGeneratedColumns() {
@@ -307,5 +307,59 @@ final class MSSQLSchemaQueriesTests: XCTestCase {
         XCTAssertTrue(tables.contains("IN ('BASE TABLE', 'VIEW')"))
         XCTAssertTrue(MSSQLSchemaQueries.columns(schema: "dbo", table: "t").contains("= 'PRIMARY KEY'"))
         XCTAssertTrue(MSSQLSchemaQueries.schemas.contains("'information_schema'"))
+    }
+
+    // MARK: - Descriptions
+
+    /// A table's description lives in `sys.extended_properties`, which no `INFORMATION_SCHEMA` view
+    /// exposes. The property is matched by the object id resolved from both names, because that is
+    /// the only spelling that survives a schema named `x.y` or a table named `a.b`.
+    func testTableListingProjectsTheDescription() {
+        let sql = MSSQLSchemaQueries.tables(in: .allSchemas)
+        XCTAssertTrue(sql.contains("CAST(ep.value AS nvarchar(max)) AS TABLE_COMMENT"))
+        XCTAssertTrue(sql.contains("LEFT JOIN sys.extended_properties ep"))
+        XCTAssertTrue(sql.contains("ep.major_id = OBJECT_ID(QUOTENAME(t.TABLE_SCHEMA) + '.' + QUOTENAME(t.TABLE_NAME))"))
+        XCTAssertTrue(sql.contains("ep.minor_id = 0"))
+        XCTAssertTrue(sql.contains("ep.name = 'MS_Description'"))
+    }
+
+    /// A column property's `minor_id` is the column's `column_id`, not its `ORDINAL_POSITION`: the
+    /// two part ways after a drop, so the join has to resolve the id from the name.
+    func testColumnsQueriesProjectTheColumnDescription() {
+        let queries = [
+            MSSQLSchemaQueries.columns(schema: "dbo", table: "Users"),
+            MSSQLSchemaQueries.allColumns(schema: "dbo")
+        ]
+        for sql in queries {
+            XCTAssertTrue(sql.contains("CAST(ep.value AS nvarchar(max)) AS COLUMN_COMMENT"))
+            XCTAssertTrue(sql.contains("LEFT JOIN sys.extended_properties ep"))
+            XCTAssertTrue(sql.contains("ep.minor_id = COLUMNPROPERTY("))
+            XCTAssertTrue(sql.contains("'ColumnId'"))
+            XCTAssertTrue(sql.contains("ep.name = 'MS_Description'"))
+        }
+    }
+
+    func testParseTableRowReadsTheDescription() {
+        let row: [String?] = ["orders", "BASE TABLE", "sales", "Orders placed"]
+        XCTAssertEqual(
+            MSSQLSchemaQueries.parseTableRow(row),
+            MSSQLTableRow(name: "orders", isView: false, schema: "sales", comment: "Orders placed")
+        )
+    }
+
+    /// A blank property is not a description: the popup has nothing to show, so it must not show
+    /// an empty line where one belongs.
+    func testParseTableRowDropsABlankDescription() {
+        XCTAssertNil(MSSQLSchemaQueries.parseTableRow(["orders", "BASE TABLE", "sales", ""])?.comment)
+    }
+
+    func testParseColumnRowReadsTheDescription() {
+        let row: [String?] = ["id", "int", nil, "10", "0", "NO", nil, "1", "1", "0", "0", "Surrogate key"]
+        XCTAssertEqual(MSSQLSchemaQueries.parseColumnRow(row)?.comment, "Surrogate key")
+    }
+
+    func testParseColumnRowDropsABlankDescription() {
+        let row: [String?] = ["id", "int", nil, "10", "0", "NO", nil, "1", "1", "0", "0", ""]
+        XCTAssertNil(MSSQLSchemaQueries.parseColumnRow(row)?.comment)
     }
 }

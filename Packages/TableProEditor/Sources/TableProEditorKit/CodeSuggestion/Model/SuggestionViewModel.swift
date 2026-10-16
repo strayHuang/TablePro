@@ -18,6 +18,12 @@ final class SuggestionViewModel: ObservableObject {
     @Published var themeTextColor: NSColor = .labelColor
 
     var itemsRequestTask: Task<Void, Never>?
+
+    /// How long a request may hold the in-flight slot. A schema read that never answers would
+    /// otherwise keep it for the life of the editor, and every keystroke after the first would be
+    /// filed away as "a request is already running".
+    private static let requestWatchdogNanos: UInt64 = 2_000_000_000
+
     weak var activeTextView: TextViewController?
     private(set) var isApplyingCompletion = false
 
@@ -201,6 +207,16 @@ final class SuggestionViewModel: ObservableObject {
                 return
             }
         }
+
+        // The in-flight slot must not outlive the request it stands for. A read that never answers
+        // would otherwise hold it for the life of the editor, and every later keystroke would be
+        // turned away as a duplicate of a request that is still running. The request itself is left
+        // alone; this only stops it from blocking the next one.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.requestWatchdogNanos)
+            guard let self, self.requestGeneration == generation else { return }
+            self.itemsRequestTask = nil
+        }
     }
 
     private func itemsForLiveEditor(
@@ -286,7 +302,11 @@ final class SuggestionViewModel: ObservableObject {
             return
         }
 
-        guard itemsRequestTask == nil else {
+        // A keystroke that lands while a request is out does not start a second one: the answer
+        // already coming is asked at the live caret, so it covers the keys typed during it. The
+        // move's presentation wish is remembered for the case where that answer turns out to be
+        // nothing, which is when a fresh request has to be made instead.
+        if itemsRequestTask != nil {
             lastDroppedMovePresents = presentIfNot
             return
         }

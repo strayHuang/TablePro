@@ -36,7 +36,8 @@ extension MSSQLPluginDriver {
             return PluginTableInfo(
                 name: table.name,
                 type: table.isView ? "VIEW" : "TABLE",
-                schema: table.schema ?? schemaFallback
+                schema: table.schema ?? schemaFallback,
+                comment: table.comment
             )
         }
     }
@@ -451,6 +452,7 @@ extension MSSQLColumnRow {
             isPrimaryKey: isPrimaryKey,
             defaultValue: defaultValue,
             extra: isIdentity ? "IDENTITY" : nil,
+            comment: comment,
             identityKind: isIdentity ? .always : nil,
             isGenerated: isGenerated
         )

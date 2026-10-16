@@ -5,12 +5,15 @@ import TableProPluginKit
 /// The FreeTDS encryption level and certificate checks behind each SSL mode. libtds reads both from the connection's
 /// freetds.conf entry and from nowhere else; see MSSQLFreeTDSServerEntry.
 ///
-/// Disabled asks for `request`, as SQL Server's own drivers do with encryption off: the login is encrypted and the rest
-/// of the session is not, unless the server forces encryption.
+/// Disabled asks for `off`: the client tells the server it cannot encrypt at all, so the whole session — including
+/// the login — runs over plain TCP. This is the only option that reaches legacy servers whose TLS cannot
+/// interoperate with modern clients. Preferred keeps the SQL Server driver convention, `request`: the login is
+/// encrypted and the rest of the session is not, unless the server forces encryption.
 enum MSSQLSSLMapping {
     static func encryptionLevel(for mode: SSLMode) -> MSSQLEncryptionLevel {
         switch mode {
-        case .disabled, .preferred: return .request
+        case .disabled: return .off
+        case .preferred: return .request
         case .required, .verifyCa, .verifyIdentity: return .require
         }
     }

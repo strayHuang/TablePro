@@ -304,6 +304,17 @@ extension TextViewController {
         let chordKeys = NSEvent.ModifierFlags([.control, .command]).rawValue
 
         guard modifierFlags & chordKeys == 0 else { return event }
+
+        // A snippet the user just accepted owns Tab and Shift-Tab until its last stop: walking the
+        // parameters is what the skeleton was inserted for. The delegate declines once the caret
+        // has left the snippet, and the indent or outdent below takes the key back.
+        if completionDelegate?.completionSnippetAdvance(
+            textView: self,
+            forward: modifierFlags & shiftKey == 0
+        ) == true {
+            return nil
+        }
+
         if modifierFlags == shiftKey {
             handleIndent(inwards: true)
         } else {

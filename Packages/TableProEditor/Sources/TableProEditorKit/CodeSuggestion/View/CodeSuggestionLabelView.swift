@@ -88,6 +88,15 @@ struct CodeSuggestionLabelView: View {
 
             Spacer(minLength: 0)
 
+            if let note = suggestion.inlineNote, !note.isEmpty {
+                Text(note)
+                    .font(Font(font))
+                    .foregroundStyle(effectiveSecondaryColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(note)
+            }
+
             if suggestion.deprecated {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: font.pointSize + 2))

@@ -105,6 +105,11 @@ final class SchemaProviderRegistry: CatalogChangeTarget {
                 try await metadataProvider.withMetadataDriver(scope: scope) { driver in
                     try await driver.sampleFieldPaths(table: table, limit: limit)
                 }
+            },
+            fetchForeignKeys: { table, schema in
+                try await metadataProvider.withMetadataDriver(scope: scope) { driver in
+                    try await driver.fetchForeignKeys(table: table, schema: schema)
+                }
             }
         )
         let provider = SQLSchemaProvider(metadataSource: source)

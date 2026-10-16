@@ -70,13 +70,57 @@ struct SQLKeywordsTests {
 
     @Test("functionItems returns correct kind")
     func testFunctionItemsCorrectKind() {
-        let items = SQLKeywords.functionItems()
+        let items = SQLKeywords.functionItems(for: nil)
 
         #expect(items.count == SQLKeywords.allFunctions.count)
 
         for item in items {
             #expect(item.kind == .function)
         }
+    }
+
+    // MARK: - Dialect filtering
+
+    /// SQL Server spells the date literals differently from ANSI, so the ANSI ones are exactly what
+    /// must not be offered on a connection to it: accepting `CURRENT_DATE` there is a syntax error.
+    @Test("A SQL Server connection is offered no date literal that engine lacks")
+    func testSQLServerFunctionListDropsANSIDateLiterals() {
+        let names = SQLKeywords.functionItems(for: .engine(for: .mssql)).map(\.label)
+
+        #expect(!names.contains("CURRENT_DATE"), "SQL Server parses no CURRENT_DATE")
+        #expect(!names.contains("CURRENT_TIME"))
+        #expect(!names.contains("CURDATE"))
+        #expect(!names.contains("DATE_FORMAT"))
+        #expect(names.contains("ISNULL"), "ISNULL is SQL Server's null fallback")
+    }
+
+    /// A shared function stays in both lists: rounding `STRING_AGG` to one engine would hide it from
+    /// the other, which is the direction the filter must not take.
+    @Test("A function two engines share is offered on both")
+    func testSharedFunctionIsOfferedOnBothEngines() {
+        let sqlServer = SQLKeywords.functionItems(for: .engine(for: .mssql)).map(\.label)
+        let postgres = SQLKeywords.functionItems(for: .engine(for: .postgresql)).map(\.label)
+
+        #expect(sqlServer.contains("STRING_AGG"))
+        #expect(postgres.contains("STRING_AGG"))
+    }
+
+    @Test("A PostgreSQL connection keeps the ANSI date literals and its own functions")
+    func testPostgresFunctionList() {
+        let names = SQLKeywords.functionItems(for: .engine(for: .postgresql)).map(\.label)
+
+        #expect(names.contains("CURRENT_DATE"))
+        #expect(names.contains("DATE_TRUNC"))
+        #expect(names.contains("JSONB_SET"))
+        #expect(!names.contains("CURDATE"), "CURDATE is MySQL-only")
+        #expect(!names.contains("NVL"), "NVL is Oracle-only")
+    }
+
+    /// An unresolved connection keeps the whole catalogue: hiding a function the engine does
+    /// support is worse than offering one it doesn't.
+    @Test("An unmodelled engine keeps every function")
+    func testUnmodelledEngineKeepsTheCatalogue() {
+        #expect(SQLKeywords.functionItems(for: .engine(for: .mongodb)).count == SQLKeywords.allFunctions.count)
     }
 
     @Test("operatorItems returns correct kind")

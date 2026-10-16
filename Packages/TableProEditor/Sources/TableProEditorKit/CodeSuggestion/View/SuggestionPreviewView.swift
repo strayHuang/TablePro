@@ -23,7 +23,7 @@ struct SuggestionPreviewView: View {
                 Text(doc)
                     .font(Font(font))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .truncationMode(.tail)
             }
             if let components = item.pathComponents, !components.isEmpty {

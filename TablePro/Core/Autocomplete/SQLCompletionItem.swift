@@ -74,8 +74,16 @@ struct SQLCompletionItem: Identifiable, Hashable {
     let insertText: String      // Text to insert (may differ from label)
     let detail: String?         // Type info, e.g., "VARCHAR(255)"
     let documentation: String?  // Tooltip/description
+    /// A short note shown inline at the trailing edge of the row, beside the label and detail.
+    /// Carries a table's or column's comment so it is visible without focusing the row.
+    let inlineNote: String?
     var sortPriority: Int       // For ranking (lower = higher priority)
     let filterText: String      // Text used for matching
+    /// Whether `filterText` may be reached by a fuzzy (subsequence) match as well as an anchored
+    /// prefix or substring match. Whole-phrase items such as the inferred join conditions opt out:
+    /// their text is long enough that almost any short word is a subsequence of it, so fuzzy
+    /// matching made a typed word surface unrelated conditions.
+    let allowsFuzzyMatch: Bool
     /// Whether `label` and `insertText` may follow the typed prefix. Defaults to `.fixed`, so a
     /// vocabulary opts in rather than having to remember to opt out: the kinds carry more than
     /// language keywords, including value literals and `table.*`, and re-casing those is a
@@ -90,8 +98,10 @@ struct SQLCompletionItem: Identifiable, Hashable {
         insertText: String? = nil,
         detail: String? = nil,
         documentation: String? = nil,
+        inlineNote: String? = nil,
         sortPriority: Int? = nil,
         filterText: String? = nil,
+        allowsFuzzyMatch: Bool = true,
         caseFolding: SQLCompletionCaseFolding = .fixed
     ) {
         self.id = UUID()
@@ -100,8 +110,10 @@ struct SQLCompletionItem: Identifiable, Hashable {
         self.insertText = insertText ?? label
         self.detail = detail
         self.documentation = documentation
+        self.inlineNote = inlineNote
         self.sortPriority = sortPriority ?? kind.basePriority
         self.filterText = filterText ?? label.lowercased()
+        self.allowsFuzzyMatch = allowsFuzzyMatch
         self.caseFolding = caseFolding
     }
 
@@ -112,8 +124,10 @@ struct SQLCompletionItem: Identifiable, Hashable {
         self.insertText = insertText
         self.detail = item.detail
         self.documentation = item.documentation
+        self.inlineNote = item.inlineNote
         self.sortPriority = item.sortPriority
         self.filterText = item.filterText
+        self.allowsFuzzyMatch = item.allowsFuzzyMatch
         self.caseFolding = item.caseFolding
         self.matchedRanges = item.matchedRanges
         self.fuzzyPenalty = item.fuzzyPenalty
@@ -238,13 +252,15 @@ extension SQLCompletionItem {
         )
     }
 
-    /// Create a table completion item
-    static func table(_ name: String, isView: Bool = false) -> SQLCompletionItem {
+    /// Create a table completion item. The table's comment rides as `inlineNote`, so it is
+    /// shown beside the name rather than only in the preview pane.
+    static func table(_ name: String, isView: Bool = false, comment: String? = nil) -> SQLCompletionItem {
         SQLCompletionItem(
             label: name,
             kind: isView ? .view : .table,
             insertText: name,
-            detail: isView ? "View" : "Table"
+            detail: isView ? "View" : "Table",
+            inlineNote: comment.flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 
@@ -288,7 +304,6 @@ extension SQLCompletionItem {
         var docParts: [String] = []
         if let tableName { docParts.append("Column from \(tableName)") }
         if let defaultValue { docParts.append("Default: \(defaultValue)") }
-        if let comment { docParts.append(comment) }
         let documentation = docParts.isEmpty ? nil : docParts.joined(separator: "\n")
 
         return SQLCompletionItem(
@@ -296,23 +311,28 @@ extension SQLCompletionItem {
             kind: .column,
             insertText: name,
             detail: detail,
-            documentation: documentation
+            documentation: documentation,
+            inlineNote: comment.flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 
-    /// Create a function completion item
+    /// Create a function completion item.
+    ///
+    /// The skeleton is what the preview pane lists *and* what accept inserts, so the two cannot
+    /// drift: a function whose parameters are spelled out is a function they get written for.
+    /// `;;` in the skeleton marks a cursor stop (see `SQLSnippetMarker`).
     static func function(
         _ name: String,
         signature: String? = nil,
         documentation: String? = nil,
         caseFolding: SQLCompletionCaseFolding = .caseInsensitive
     ) -> SQLCompletionItem {
-        let insertText = signature != nil ? "\(name)()" : name
+        let insertText = signature ?? name
         return SQLCompletionItem(
             label: name,
             kind: .function,
             insertText: insertText,
-            detail: signature,
+            detail: signature.map(SQLSnippetMarker.stripped),
             documentation: documentation,
             caseFolding: caseFolding
         )

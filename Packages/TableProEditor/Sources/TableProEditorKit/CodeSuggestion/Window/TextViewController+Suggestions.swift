@@ -26,4 +26,23 @@ public extension TextViewController {
         controller.close()
         return wasShowing
     }
+
+    /// Opens the completion list at the caret without a manual-trigger flag, so the answer is the
+    /// one the position itself earns.
+    ///
+    /// The caller is whoever edited the text and knows the caret landed somewhere worth listing —
+    /// a snippet's stop is the case that needed it. It is deliberately not Escape or Ctrl-Space:
+    /// those two ask for everything the position can offer, while this asks for what the position
+    /// offers on its own, and the trigger policy still gets to shut a list it would shut for a
+    /// keystroke. A window clause is where the difference shows: `… OVER (PARTITION BY ` lists the
+    /// clauses that belong inside the parentheses, and it does so only because the policy exempts
+    /// that clause from the empty-prefix rule.
+    func requestCompletions() {
+        guard let completionDelegate, let cursorPosition = cursorPositions.first else { return }
+        SuggestionController.shared.showCompletions(
+            textView: self,
+            delegate: completionDelegate,
+            cursorPosition: cursorPosition
+        )
+    }
 }

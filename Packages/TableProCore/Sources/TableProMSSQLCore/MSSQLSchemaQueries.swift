@@ -163,31 +163,34 @@ public enum MSSQLSchemaQueries {
 
     /// The same listing over one schema, a named set of them, or every schema `schemas` returns. The
     /// last filters by that query itself rather than dropping the schema predicate, so a table is
-    /// listed here exactly when its schema is listed there. Both multi-schema listings project each
-    /// row's schema as a third column.
+    /// listed here exactly when its schema is listed there. Every row projects its schema as the
+    /// third column and its `MS_Description` as the fourth, so `parseTableRow` reads one shape
+    /// whatever the scope.
     public static func tables(in scope: MSSQLTableListingScope) -> String {
         let schemaFilter: String
-        let schemaColumn: String
         let orderBy: String
         switch scope {
         case .schema(let schema):
             schemaFilter = "t.TABLE_SCHEMA = \(MSSQLStringLiteral.quoted(schema))"
-            schemaColumn = ""
             orderBy = "t.TABLE_NAME"
         case .schemas(let schemas):
             schemaFilter = schemas.isEmpty
                 ? "1 = 0"
                 : "t.TABLE_SCHEMA IN (\(schemas.map(MSSQLStringLiteral.quoted).joined(separator: ", ")))"
-            schemaColumn = ", t.TABLE_SCHEMA"
             orderBy = "t.TABLE_SCHEMA, t.TABLE_NAME"
         case .allSchemas:
             schemaFilter = "t.TABLE_SCHEMA IN (\n\(listedSchemaNames)\n)"
-            schemaColumn = ", t.TABLE_SCHEMA"
             orderBy = "t.TABLE_SCHEMA, t.TABLE_NAME"
         }
         return """
-            SELECT t.TABLE_NAME, t.TABLE_TYPE\(schemaColumn)
+            SELECT t.TABLE_NAME, t.TABLE_TYPE, t.TABLE_SCHEMA,
+                CAST(ep.value AS nvarchar(max)) AS TABLE_COMMENT
             FROM INFORMATION_SCHEMA.TABLES t
+            LEFT JOIN sys.extended_properties ep
+                ON ep.major_id = OBJECT_ID(QUOTENAME(t.TABLE_SCHEMA) + '.' + QUOTENAME(t.TABLE_NAME))
+                AND ep.minor_id = 0
+                AND ep.class = 1
+                AND ep.name = 'MS_Description'
             WHERE \(schemaFilter)
               AND t.TABLE_TYPE IN ('BASE TABLE', 'VIEW')
             ORDER BY \(orderBy)
@@ -215,6 +218,7 @@ public enum MSSQLSchemaQueries {
                     AND tc.TABLE_SCHEMA = \(s)
                     AND tc.TABLE_NAME = \(t)
             ) pk ON c.COLUMN_NAME = pk.COLUMN_NAME
+            \(columnCommentJoin)
             WHERE c.TABLE_NAME = \(t)
               AND c.TABLE_SCHEMA = \(s)
             ORDER BY c.ORDINAL_POSITION
@@ -239,12 +243,13 @@ public enum MSSQLSchemaQueries {
                 WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
                     AND tc.TABLE_SCHEMA = \(s)
             ) pk ON c.TABLE_NAME = pk.TABLE_NAME AND c.COLUMN_NAME = pk.COLUMN_NAME
+            \(columnCommentJoin)
             WHERE c.TABLE_SCHEMA = \(s)
             ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
             """
     }
 
-    public static let allColumnsTableNameIndex = 11
+    public static let allColumnsTableNameIndex = 12
 
     /// A `rowversion` column reports its type as `timestamp`, and a system-versioned period or ledger column reports a
     /// `GeneratedAlwaysType` above zero. Neither is identity or computed, and the server refuses a written value for
@@ -264,7 +269,19 @@ public enum MSSQLSchemaQueries {
                     WHEN c.DATA_TYPE = 'timestamp' THEN 1
                     WHEN COLUMNPROPERTY(\(columnObjectID), c.COLUMN_NAME, 'GeneratedAlwaysType') > 0 THEN 1
                     ELSE 0
-                END AS IS_SERVER_GENERATED
+                END AS IS_SERVER_GENERATED,
+                CAST(ep.value AS nvarchar(max)) AS COLUMN_COMMENT
+        """
+
+    /// The column's own `MS_Description`, at `columnSelectList`'s last slot. `minor_id` of a column
+    /// property is the column's `column_id` rather than its `ORDINAL_POSITION`, which the two part
+    /// ways after a drop, so the join resolves the id from the name.
+    private static let columnCommentJoin = """
+        LEFT JOIN sys.extended_properties ep
+            ON ep.major_id = \(columnObjectID)
+            AND ep.minor_id = COLUMNPROPERTY(\(columnObjectID), c.COLUMN_NAME, 'ColumnId')
+            AND ep.class = 1
+            AND ep.name = 'MS_Description'
         """
 
     private static let columnObjectID = "OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME))"
@@ -314,11 +331,13 @@ public struct MSSQLTableRow: Sendable, Equatable {
     public let name: String
     public let isView: Bool
     public let schema: String?
+    public let comment: String?
 
-    public init(name: String, isView: Bool, schema: String? = nil) {
+    public init(name: String, isView: Bool, schema: String? = nil, comment: String? = nil) {
         self.name = name
         self.isView = isView
         self.schema = schema
+        self.comment = comment
     }
 }
 
@@ -334,6 +353,7 @@ public struct MSSQLColumnRow: Sendable, Equatable {
     public let isPrimaryKey: Bool
     public let isComputed: Bool
     public let isServerGenerated: Bool
+    public let comment: String?
 
     public init(
         name: String,
@@ -346,7 +366,8 @@ public struct MSSQLColumnRow: Sendable, Equatable {
         isIdentity: Bool,
         isPrimaryKey: Bool,
         isComputed: Bool = false,
-        isServerGenerated: Bool = false
+        isServerGenerated: Bool = false,
+        comment: String? = nil
     ) {
         self.name = name
         self.dataType = dataType
@@ -359,6 +380,7 @@ public struct MSSQLColumnRow: Sendable, Equatable {
         self.isPrimaryKey = isPrimaryKey
         self.isComputed = isComputed
         self.isServerGenerated = isServerGenerated
+        self.comment = comment
     }
 
     /// Whether the server refuses any value written to the column, which is what the host treats as generated.
@@ -428,7 +450,12 @@ public extension MSSQLSchemaQueries {
     static func parseTableRow(_ row: [String?]) -> MSSQLTableRow? {
         guard let name = row[safe: 0] ?? nil else { return nil }
         let typeRaw = (row[safe: 1] ?? nil) ?? "BASE TABLE"
-        return MSSQLTableRow(name: name, isView: typeRaw == "VIEW", schema: row[safe: 2] ?? nil)
+        return MSSQLTableRow(
+            name: name,
+            isView: typeRaw == "VIEW",
+            schema: row[safe: 2] ?? nil,
+            comment: (row[safe: 3] ?? nil).flatMap { $0.isEmpty ? nil : $0 }
+        )
     }
 
     static func parseColumnRow(_ row: [String?]) -> MSSQLColumnRow? {
@@ -444,7 +471,8 @@ public extension MSSQLSchemaQueries {
             isIdentity: (row[safe: 7] ?? nil) == "1",
             isPrimaryKey: (row[safe: 8] ?? nil) == "1",
             isComputed: (row[safe: 9] ?? nil) == "1",
-            isServerGenerated: (row[safe: 10] ?? nil) == "1"
+            isServerGenerated: (row[safe: 10] ?? nil) == "1",
+            comment: (row[safe: 11] ?? nil).flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 

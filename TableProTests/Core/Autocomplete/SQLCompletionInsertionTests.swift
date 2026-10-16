@@ -44,12 +44,39 @@ struct SQLCompletionInsertionTests {
         #expect(resolution.cursorOffset == ("SELECT * FROM users" as NSString).length)
     }
 
-    @Test("Function completion parks the caret between the parentheses")
-    func functionParenRule() {
-        let item = SQLCompletionItem.function("COUNT", signature: "COUNT(expr)")
+    /// A function's skeleton is what accept inserts, parameters and all, and every `;;` in it is a
+    /// stop the editor can walk: the placeholder it names is selected so typing replaces it.
+    @Test("Function completion writes the whole signature and stops on every parameter")
+    func functionSignatureWritesEveryParameter() {
+        let item = SQLCompletionItem.function("COUNT", signature: "COUNT(;;expr)")
         let resolution = SQLCompletionInsertion.resolve(for: item)
-        #expect(resolution.text == "COUNT()")
+        #expect(resolution.text == "COUNT(expr)")
         #expect(resolution.cursorOffset == 6)
+        #expect(resolution.stops == [SQLCompletionInsertion.Stop(offset: 6, length: 4)])
+    }
+
+    @Test("A window function's skeleton walks its OVER clause too")
+    func windowSkeletonWalksItsClauses() {
+        let item = SQLCompletionItem.function(
+            "ROW_NUMBER",
+            signature: "ROW_NUMBER() OVER (PARTITION BY ;; ORDER BY ;; )"
+        )
+        let resolution = SQLCompletionInsertion.resolve(for: item)
+        #expect(resolution.text == "ROW_NUMBER() OVER (PARTITION BY  ORDER BY  )")
+        #expect(resolution.stops == [
+            SQLCompletionInsertion.Stop(offset: 32, length: 0),
+            SQLCompletionInsertion.Stop(offset: 42, length: 0)
+        ])
+    }
+
+    /// A signature with no marker keeps the parenthesis rule rather than inserting a skeleton.
+    @Test("A markerless function signature parks the caret between the parentheses")
+    func markerlessSignatureParkedBetweenParens() {
+        let item = SQLCompletionItem.function("PI", signature: "PI()")
+        let resolution = SQLCompletionInsertion.resolve(for: item)
+        #expect(resolution.text == "PI()")
+        #expect(resolution.cursorOffset == 3)
+        #expect(resolution.stops.isEmpty)
     }
 
     @Test("Markerless favorite ending in parentheses keeps the paren rule")

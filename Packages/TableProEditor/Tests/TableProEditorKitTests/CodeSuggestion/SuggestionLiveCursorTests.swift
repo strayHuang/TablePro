@@ -225,6 +225,40 @@ final class SuggestionLiveCursorTests: XCTestCase {
         XCTAssertIdentical(suggestions.model.activeTextView, controller)
         XCTAssertEqual(suggestions.model.items.map(\.label), ["id", "name"])
     }
+
+    /// The reported failure: one request that never answers held the in-flight slot for the life of
+    /// the editor, and every key after the first was filed away behind it, so the popup went silent
+    /// and stayed silent. The watchdog is what expires that slot.
+    @MainActor
+    func test_showCompletions_aRequestThatNeverAnswersStopsSilencingKeysAfterTheWatchdog() async throws {
+        let (window, controller) = Mock.keyWindowedTextViewController()
+        let delegate = ParkingDelegate(answers: [:], reranked: [:])
+        controller.completionDelegate = delegate
+        let suggestions = SuggestionController.shared
+        defer {
+            suggestions.close()
+            window.close()
+        }
+
+        controller.textView.replaceCharacters(in: NSRange(location: 0, length: 0), with: "s")
+        controller.setCursorPositions([CursorPosition(range: NSRange(location: 1, length: 0))])
+        let request = try XCTUnwrap(suggestions.model.itemsRequestTask)
+        await delegate.readTheEditor()
+        XCTAssertEqual(delegate.askedAt, [1])
+
+        controller.textView.replaceCharacters(in: NSRange(location: 1, length: 0), with: "e")
+        controller.setCursorPositions([CursorPosition(range: NSRange(location: 2, length: 0))])
+        XCTAssertEqual(delegate.askedAt, [1], "a key while the request is out is folded into it")
+
+        try await Task.sleep(for: .seconds(2.5))
+
+        controller.textView.replaceCharacters(in: NSRange(location: 2, length: 0), with: "l")
+        controller.setCursorPositions([CursorPosition(range: NSRange(location: 3, length: 0))])
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(delegate.askedAt, [1, 3], "the key after the watchdog asks on its own")
+        request.cancel()
+    }
 }
 
 @MainActor

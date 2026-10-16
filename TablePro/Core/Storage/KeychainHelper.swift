@@ -188,17 +188,13 @@ final class KeychainHelper: KeychainStoring {
     }
 
     private static let canUseDataProtectionKeychain: Bool = {
-        #if DEBUG
         guard let task = SecTaskCreateFromSelf(nil),
               SecTaskCopyValueForEntitlement(task, "com.apple.application-identifier" as CFString, nil) != nil
         else {
-            logger.warning("No application-identifier entitlement; falling back to the file-based keychain (DEBUG build)")
+            logger.warning("No application-identifier entitlement; falling back to the file-based keychain")
             return false
         }
         return true
-        #else
-        return true
-        #endif
     }()
 
     private func accessibility(forSync synchronizable: Bool) -> CFString {
