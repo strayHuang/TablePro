@@ -100,6 +100,24 @@ struct SQLContext {
     /// join-condition completions belong here too. The clause stays `.and` either way.
     let andContinuesJoin: Bool
 
+    /// True when a join condition is already written before the cursor, so an inferred condition
+    /// would be another one rather than the first. Covers both an `AND`/`OR` continuing an `ON`
+    /// and a cursor resting past the `ON`'s own operand; the completions then insert `AND` in
+    /// front of themselves (`AND a.id = b.a_id`).
+    let joinConditionContinuation: Bool
+
+    /// True when the SELECT list already holds a field. An empty list, or one holding only a `*`,
+    /// leaves the cursor at a clause transition, where `FROM` alone is offered; once a field is
+    /// named the list is being added to instead, so the fields are offered.
+    let selectListHasField: Bool
+
+    /// True when the token under the cursor is the `*` of a SELECT list. A `*` is not an identifier
+    /// character, so it leaves `prefix` empty and `selectListHasField` false exactly like a bare
+    /// `SELECT`; this flag is what tells the two apart. The star stays inside `prefixRange` so an
+    /// accepted completion overwrites it, and the columns of the tables in scope are offered as its
+    /// expansion.
+    let selectListEndsWithStar: Bool
+
     init(
         clauseType: SQLClauseType,
         prefix: String,
@@ -114,7 +132,10 @@ struct SQLContext {
         isAfterComma: Bool = false,
         expectsObjectName: Bool = false,
         comparisonColumn: String? = nil,
-        andContinuesJoin: Bool = false
+        andContinuesJoin: Bool = false,
+        joinConditionContinuation: Bool = false,
+        selectListHasField: Bool = false,
+        selectListEndsWithStar: Bool = false
     ) {
         self.clauseType = clauseType
         self.prefix = prefix
@@ -130,6 +151,9 @@ struct SQLContext {
         self.expectsObjectName = expectsObjectName
         self.comparisonColumn = comparisonColumn
         self.andContinuesJoin = andContinuesJoin
+        self.joinConditionContinuation = joinConditionContinuation
+        self.selectListHasField = selectListHasField
+        self.selectListEndsWithStar = selectListEndsWithStar
     }
 
     func replacingTableReferences(_ references: [TableReference]) -> SQLContext {
@@ -147,7 +171,10 @@ struct SQLContext {
             isAfterComma: isAfterComma,
             expectsObjectName: expectsObjectName,
             comparisonColumn: comparisonColumn,
-            andContinuesJoin: andContinuesJoin
+            andContinuesJoin: andContinuesJoin,
+            joinConditionContinuation: joinConditionContinuation,
+            selectListHasField: selectListHasField,
+            selectListEndsWithStar: selectListEndsWithStar
         )
     }
 
@@ -409,6 +436,12 @@ final class SQLContextAnalyzer {
         let isCastTarget = endsWithCastOperator(nsBeforeCursor, before: prefixStart)
         let comparisonColumn = comparisonTarget(in: nsBeforeCursor, before: prefixStart)
 
+        // `extractPrefix` folds a star directly behind the cursor into `prefixRange` (out of
+        // `prefix`), so the range's first character being a `*` is what marks the star token.
+        let selectListEndsWithStar = resolution.clause == .select
+            && prefixStart < nsBeforeCursor.length
+            && nsBeforeCursor.character(at: prefixStart) == Self.star
+
         return SQLContext(
             clauseType: isCastTarget ? .castTarget : resolution.clause,
             prefix: prefix,
@@ -423,7 +456,10 @@ final class SQLContextAnalyzer {
             isAfterComma: isAfterComma,
             expectsObjectName: resolution.expectsObjectName,
             comparisonColumn: comparisonColumn,
-            andContinuesJoin: resolution.andContinuesJoin
+            andContinuesJoin: resolution.andContinuesJoin,
+            joinConditionContinuation: resolution.joinConditionContinuation,
+            selectListHasField: resolution.selectListHasField,
+            selectListEndsWithStar: selectListEndsWithStar
         )
     }
 
@@ -806,14 +842,22 @@ final class SQLContextAnalyzer {
             return ("", 0, nil)
         }
 
-        let start = SQLTokenBoundary.segmentStart(in: ns, endingAt: length)
-        let prefix = SQLTokenBoundary.matchText(of: ns.substring(from: start))
+        let segmentStart = SQLTokenBoundary.segmentStart(in: ns, endingAt: length)
+        let prefix = SQLTokenBoundary.matchText(of: ns.substring(from: segmentStart))
 
-        guard start > 0, ns.character(at: start - 1) == Self.dot else {
+        // A `*` sits outside the segment because it is not an identifier character, yet a star
+        // typed into a SELECT list is the token an accepted completion must overwrite. Keep it
+        // inside the replacement range and out of the prefix, the same shape an opening identifier
+        // quote already has: the range covers the star, the matcher never sees it.
+        let start = segmentStart > 0 && ns.character(at: segmentStart - 1) == Self.star
+            ? segmentStart - 1
+            : segmentStart
+
+        guard segmentStart > 0, ns.character(at: segmentStart - 1) == Self.dot else {
             return (prefix, start, nil)
         }
 
-        let qualifierEnd = start - 1
+        let qualifierEnd = segmentStart - 1
         let qualifierStart = SQLTokenBoundary.segmentStart(in: ns, endingAt: qualifierEnd)
         guard qualifierStart < qualifierEnd else {
             return (prefix, start, nil)
@@ -1005,11 +1049,23 @@ final class SQLContextAnalyzer {
         let expectsObjectName: Bool
         /// See `SQLContext.andContinuesJoin`. Only ever set for an `.and` resolution.
         let andContinuesJoin: Bool
+        /// See `SQLContext.joinConditionContinuation`.
+        let joinConditionContinuation: Bool
+        /// See `SQLContext.selectListHasField`. Only ever set for a `.select` resolution.
+        let selectListHasField: Bool
 
-        init(clause: SQLClauseType, expectsObjectName: Bool, andContinuesJoin: Bool = false) {
+        init(
+            clause: SQLClauseType,
+            expectsObjectName: Bool,
+            andContinuesJoin: Bool = false,
+            joinConditionContinuation: Bool = false,
+            selectListHasField: Bool = false
+        ) {
             self.clause = clause
             self.expectsObjectName = expectsObjectName
             self.andContinuesJoin = andContinuesJoin
+            self.joinConditionContinuation = joinConditionContinuation
+            self.selectListHasField = selectListHasField
         }
     }
 
@@ -1137,10 +1193,30 @@ final class SQLContextAnalyzer {
                         return ClauseResolution(
                             clause: .and,
                             expectsObjectName: false,
-                            andContinuesJoin: clause.clause == .on
+                            andContinuesJoin: clause.clause == .on,
+                            joinConditionContinuation: clause.clause == .on
                         )
                     }
-                    return clause
+                    switch clause.clause {
+                    case .select:
+                        // A word between the `SELECT` and the cursor names a field; a `*` is not a
+                        // word, so a star-only list reports none and is treated as empty.
+                        return ClauseResolution(
+                            clause: .select,
+                            expectsObjectName: false,
+                            selectListHasField: tokens[(index + 1)...].contains { $0.kind == .word }
+                        )
+                    case .on:
+                        // An identifier between the `ON` and the cursor is the condition already
+                        // written, so an inferred condition would be another one.
+                        return ClauseResolution(
+                            clause: .on,
+                            expectsObjectName: false,
+                            joinConditionContinuation: sawObject
+                        )
+                    default:
+                        return clause
+                    }
                 }
                 if !slotClosed { sawObject = true }
             }

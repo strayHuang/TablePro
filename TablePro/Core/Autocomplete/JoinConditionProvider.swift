@@ -55,11 +55,15 @@ enum JoinConditionProvider {
     ///
     /// Each pair is written once, in table order (`FROM` table first, joined table second), so
     /// the list carries no mirrored duplicate of the same condition. `excluding` carries the
-    /// pairs already written so a continuation does not repeat them.
+    /// pairs already written so a continuation does not repeat them. `continuedWithAnd` marks a
+    /// continuation: each item then inserts `AND` in front of itself (`AND a.id = b.a_id`) and its
+    /// filter text carries the `and` prefix, so a typed `and` still matches the whole conditions
+    /// instead of collapsing the list to none.
     static func items(
         for tables: [Table],
         excluding used: Set<String> = [],
-        limit: Int = maxConditions
+        limit: Int = maxConditions,
+        continuedWithAnd: Bool = false
     ) -> [SQLCompletionItem] {
         guard tables.count > 1, limit > 0 else { return [] }
 
@@ -80,7 +84,7 @@ enum JoinConditionProvider {
         for candidate in ranked {
             guard items.count < limit else { break }
             let label = "\(candidate.left) = \(candidate.right)"
-            items.append(conditionItem(label: label, tier: candidate.tier))
+            items.append(conditionItem(label: label, tier: candidate.tier, continuedWithAnd: continuedWithAnd))
         }
         return items
     }
@@ -198,20 +202,29 @@ enum JoinConditionProvider {
 
     // MARK: - Condition Items
 
-    private static func conditionItem(label: String, tier: Int) -> SQLCompletionItem {
+    private static func conditionItem(
+        label: String,
+        tier: Int,
+        continuedWithAnd: Bool = false
+    ) -> SQLCompletionItem {
         let tierBase = tier < tierPriorities.count
             ? tierPriorities[tier]
             : (tierPriorities.last ?? Tier.numeric * 10)
+        // A continuation writes `AND` in front of the condition, and matches the typed `and`
+        // through its filter text so the whole conditions stay offered while that word is typed.
+        let insertText = continuedWithAnd ? "AND \(label)" : label
+        let filterText = continuedWithAnd ? "and \(label.lowercased())" : label.lowercased()
         return SQLCompletionItem(
             label: label,
             kind: .column,
-            insertText: label,
+            insertText: insertText,
             detail: relationLabel(for: tier),
             // The ranker adds the label's length back as a tie-breaker ("shorter names slightly
             // preferred"), which is longer than the gap between tiers here. Subtracting it cancels
             // that term, so the tier decides the order and a same-name primary key (tier 1) can no
             // longer be overtaken by a longer column name of a lower tier (tier 2).
             sortPriority: tierBase - (label as NSString).length,
+            filterText: filterText,
             // A whole condition is a long phrase, so a three-letter word is a subsequence of most
             // of them: typing `and` used to collapse the list to whichever condition happened to
             // spell a-n-d. Matching anchor and substring only keeps the prefix behaviour honest.

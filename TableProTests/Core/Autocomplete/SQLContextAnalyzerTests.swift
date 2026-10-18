@@ -546,6 +546,54 @@ struct SQLContextAnalyzerTests {
         #expect(context.prefix == "")
     }
 
+    // MARK: - SELECT list shape
+
+    @Test("An empty SELECT list has no field and no star")
+    func emptySelectListHasNoField() {
+        let context = analyzer.analyze(query: "SELECT ", cursorPosition: 7)
+        #expect(context.clauseType == .select)
+        #expect(!context.selectListHasField)
+        #expect(!context.selectListEndsWithStar)
+    }
+
+    @Test("A star-only SELECT list counts as empty, not as a field")
+    func starOnlySelectListHasNoField() {
+        let context = analyzer.analyze(query: "SELECT * ", cursorPosition: 9)
+        #expect(context.clauseType == .select)
+        #expect(!context.selectListHasField)
+        #expect(!context.selectListEndsWithStar)
+    }
+
+    @Test("A named field marks the SELECT list as started")
+    func namedFieldSelectListHasField() {
+        let context = analyzer.analyze(query: "SELECT a ", cursorPosition: 9)
+        #expect(context.clauseType == .select)
+        #expect(context.selectListHasField)
+    }
+
+    @Test("A star directly under the cursor marks the SELECT star token")
+    func starUnderCursorMarksSelectListEndsWithStar() {
+        let query = "SELECT *"
+        let context = analyzer.analyze(query: query, cursorPosition: (query as NSString).length)
+        #expect(context.clauseType == .select)
+        #expect(context.selectListEndsWithStar)
+        // The star is not an identifier char, so it stays out of the prefix but inside the range
+        // an accepted completion replaces.
+        #expect(context.prefix == "")
+        #expect(context.prefixRange.lowerBound == 7)
+        #expect(context.prefixRange.upperBound == 8)
+    }
+
+    @Test("Text typed after the star filters on it and the range still covers the star")
+    func starThenTextFiltersOnBareText() {
+        let query = "SELECT *i"
+        let context = analyzer.analyze(query: query, cursorPosition: (query as NSString).length)
+        #expect(context.clauseType == .select)
+        #expect(context.prefix == "i")
+        #expect(context.prefixRange.lowerBound == 7)
+        #expect(context.prefixRange.upperBound == 9)
+    }
+
     // MARK: - P0: CF-4 - Function context detection
 
     @Test("COUNT( detected as function context")

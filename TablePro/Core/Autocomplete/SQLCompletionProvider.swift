@@ -109,16 +109,21 @@ final class SQLCompletionProvider {
 
         let limit = maxSuggestions(for: context.clauseType)
 
-        return (Array(candidates.prefix(limit)), Array(candidates.prefix(sessionPool(for: limit))), context)
+        // The popup shows `limit` rows, but the session keeps every ranked candidate: an open popup
+        // re-ranks against what it kept rather than asking again, and a candidate cut at the opening
+        // prefix can never lead for a longer one however well the survivors are ordered. A 400-item
+        // cap used to drop the tail outright — with hundreds of same-schema tables, a table sitting
+        // past it was never offered however exactly the typed prefix named it.
+        return (Array(candidates.prefix(limit)), candidates, context)
     }
 
     /// Filter, rank and cut a session's candidates down to what the popup shows.
     ///
-    /// The popup shows `maxSuggestions`, but the session holds `sessionPool` of them, because an
-    /// open popup re-ranks against what it kept rather than asking again. A candidate cut at the
-    /// opening prefix can never lead for a longer one however well the survivors are ordered, and
-    /// PostgreSQL declares more `T`-prefixed functions than the popup shows rows, every one of
-    /// them outranking the `TRUE` keyword for the single letter `t`.
+    /// The popup shows `maxSuggestions`; the session itself keeps the whole ranked list so an open
+    /// popup can re-rank it against a longer prefix. A candidate cut at the opening prefix can never
+    /// lead for a longer one however well the survivors are ordered, and PostgreSQL declares more
+    /// `T`-prefixed functions than the popup shows rows, every one of them outranking the `TRUE`
+    /// keyword for the single letter `t`.
     func filterRankAndLimit(
         _ items: [SQLCompletionItem],
         prefix: String,
@@ -126,11 +131,6 @@ final class SQLCompletionProvider {
     ) -> [SQLCompletionItem] {
         Array(filterAndRank(items, prefix: prefix, context: context).prefix(maxSuggestions(for: context.clauseType)))
     }
-
-    /// Ten times what the popup shows. Ranking is linear in the pool and the filter beside it
-    /// already walks every candidate: measured at 36us for 40 candidates and 340us for 400, against
-    /// 4ms at 5,000, which is why the pool is bounded rather than kept whole.
-    private func sessionPool(for limit: Int) -> Int { limit * 10 }
 
     /// Generic SQL functions plus the active dialect's own functions (deduplicated).
     /// Cached per dialect; invalidated in `setDatabaseType`.
@@ -233,6 +233,35 @@ final class SQLCompletionProvider {
                 if funcName.uppercased() != "COUNT" {
                     items += filterKeywords(["DISTINCT"])
                 }
+            } else if context.selectListEndsWithStar && !context.tableReferences.isEmpty {
+                // A typed `*` expands to the columns of the tables in scope, so a column can be
+                // picked in its place: the star is inside `prefixRange`, so accepting one overwrites
+                // it. The `*` and `table.*` items stay, so the star itself is still there to keep.
+                // With no table named yet there is nothing to expand to, and the position falls to
+                // the clause transition below, which offers `FROM`.
+                items.append(SQLCompletionItem(
+                    label: "*",
+                    kind: .keyword,
+                    insertText: "*",
+                    detail: "All columns",
+                    sortPriority: 50
+                ))
+                for ref in context.tableReferences {
+                    let qualifier = ref.alias ?? ref.tableName
+                    items.append(SQLCompletionItem(
+                        label: "\(qualifier).*",
+                        kind: .keyword,
+                        insertText: "\(qualifier).*",
+                        detail: "All columns from \(ref.tableName)",
+                        sortPriority: 60
+                    ))
+                }
+                items += await columnItems(for: context.tableReferences)
+            } else if context.prefix.isEmpty && !context.selectListHasField {
+                // The SELECT list is empty: the cursor sits at the clause transition, where `FROM`
+                // is the only thing that can follow. The functions and other transitions are
+                // withheld until a field is named, so a lone `FROM` is what a space offers.
+                items = filterKeywords(["FROM"])
             } else {
                 items.append(SQLCompletionItem(
                     label: "*",
@@ -263,8 +292,11 @@ final class SQLCompletionProvider {
         case .on:
             // Whole join conditions (`t1.col = t2.col`), inferred from foreign keys and column
             // metadata, lead the list. The single columns below stay, so a half-written condition
-            // can still be finished one name at a time.
-            items += await joinConditionItems(for: context, text: text)
+            // can still be finished one name at a time. When a condition is already written, each
+            // offered one inserts `AND` in front of itself.
+            items += await joinConditionItems(
+                for: context, text: text, continuedWithAnd: context.joinConditionContinuation
+            )
             items += await allowedValueItems(for: context)
             // HP-3: ON clause — prioritize columns from joined tables
             items += await columnItems(for: context.tableReferences)
@@ -300,9 +332,10 @@ final class SQLCompletionProvider {
 
         case .where_, .and, .having:
             // HP-8: Columns, operators, logical keywords + clause transitions
-            // An `AND`/`OR` that continues an `ON` can still take another join condition.
+            // An `AND`/`OR` that continues an `ON` can still take another join condition, and
+            // each offered one inserts the `AND` the user just typed.
             if context.andContinuesJoin {
-                items += await joinConditionItems(for: context, text: text)
+                items += await joinConditionItems(for: context, text: text, continuedWithAnd: true)
             }
             items += await allowedValueItems(for: context)
             items += await columnItems(for: context.tableReferences)
@@ -616,8 +649,14 @@ final class SQLCompletionProvider {
 
     /// Whole join conditions (`t1.col = t2.col`) relating the statement's tables, inferred from
     /// foreign keys and column name/type metadata. Columns and foreign keys both come from the
-    /// schema provider's caches, and pairs the statement already wrote are skipped.
-    private func joinConditionItems(for context: SQLContext, text: String) async -> [SQLCompletionItem] {
+    /// schema provider's caches, and pairs the statement already wrote are skipped. When the
+    /// condition is a continuation — an `AND` typed, or one already written before the cursor —
+    /// `continuedWithAnd` makes each item insert `AND` in front of itself and match the typed `and`.
+    private func joinConditionItems(
+        for context: SQLContext,
+        text: String,
+        continuedWithAnd: Bool
+    ) async -> [SQLCompletionItem] {
         guard context.tableReferences.count > 1, let schemaProvider else { return [] }
 
         var tables: [JoinConditionProvider.Table] = []
@@ -645,7 +684,9 @@ final class SQLCompletionProvider {
         }
 
         return JoinConditionProvider.items(
-            for: tables, excluding: JoinConditionProvider.usedConditionKeys(in: text)
+            for: tables,
+            excluding: JoinConditionProvider.usedConditionKeys(in: text),
+            continuedWithAnd: continuedWithAnd
         )
     }
 

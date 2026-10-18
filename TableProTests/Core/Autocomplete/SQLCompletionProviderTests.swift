@@ -43,6 +43,42 @@ struct SQLCompletionProviderTests {
         #expect(hasExpectedItems)
     }
 
+    /// A lone `FROM` is the only thing that can follow an empty SELECT list. The computed functions
+    /// used to lead the list, and the `FROM` the reader needed sat below them.
+    @Test("An empty SELECT list offers only FROM")
+    func emptySelectListOffersOnlyFrom() async {
+        let text = "SELECT "
+        let (items, _) = await provider.getCompletions(text: text, cursorPosition: text.count)
+        #expect(items.map(\.label) == ["FROM"])
+    }
+
+    /// A star with no table named yet has nothing to expand to, so the position is still the clause
+    /// transition and offers the same lone `FROM`.
+    @Test("A star before any table offers only FROM")
+    func starBeforeAnyTableOffersOnlyFrom() async {
+        let text = "SELECT * "
+        let (items, _) = await provider.getCompletions(text: text, cursorPosition: text.count)
+        #expect(items.map(\.label) == ["FROM"])
+    }
+
+    /// A typed `*` under the cursor is replaced by whatever is accepted, so the columns of the table
+    /// in scope are what a column can be picked in place of.
+    @Test("A star with a table in scope expands to that table's columns")
+    func starExpandsToColumnsInScope() async {
+        let driver = MockDatabaseDriver()
+        driver.tablesToReturn = [TestFixtures.makeTableInfo(name: "users")]
+        driver.columnsToReturn = ["users": [TestFixtures.makeColumnInfo(name: "id")]]
+        await schemaProvider.loadSchema(using: driver, connection: TestFixtures.makeConnection())
+
+        let text = "SELECT * FROM users"
+        let (items, context) = await provider.getCompletions(text: text, cursorPosition: 8)
+
+        #expect(context.selectListEndsWithStar)
+        #expect(items.contains { $0.kind == .column && $0.label == "id" })
+        #expect(items.contains { $0.label == "users.*" })
+        #expect(driver.fetchColumnsCalls == ["users"])
+    }
+
     @Test("FROM clause returns JOIN keywords and WHERE")
     func testFromClauseReturnsJoinAndWhere() async {
         let text = "SELECT * FROM users "
@@ -344,12 +380,15 @@ struct SQLCompletionProviderTests {
 
     // MARK: - P0: CF-3 - Star Wildcard in SELECT
 
-    @Test("SELECT clause includes * wildcard at top")
+    /// An empty SELECT list sits at the clause transition, where `FROM` is the answer. The wildcard
+    /// belongs to a list that already holds a field (or one being replaced), so it is offered once a
+    /// field is named.
+    @Test("SELECT clause includes * wildcard once a field is named")
     func testSelectStarWildcard() async {
-        let text = "SELECT "
+        let text = "SELECT a "
         let (items, _) = await provider.getCompletions(text: text, cursorPosition: text.count)
         let starItem = items.first { $0.label == "*" }
-        #expect(starItem != nil, "SELECT should include * wildcard")
+        #expect(starItem != nil, "SELECT list with a field should include * wildcard")
         #expect(starItem?.sortPriority == 50, "* should have high priority (50)")
     }
 
@@ -987,13 +1026,15 @@ struct SQLCompletionProviderTests {
 
     // MARK: - Column Fallback Without FROM
 
-    @Test("SELECT without FROM returns keywords and functions")
+    /// With no field named yet, the empty SELECT list is a clause transition and offers `FROM`
+    /// alone. The wildcard used to be offered here, but a star cannot be expanded into columns
+    /// before a table is named, so `FROM` is what the position wants.
+    @Test("An empty SELECT without FROM offers FROM")
     func testSelectWithoutFromReturnsItems() async {
         let text = "SELECT "
         let (items, _) = await provider.getCompletions(text: text, cursorPosition: text.count)
         #expect(!items.isEmpty)
-        let hasStar = items.contains { $0.label == "*" }
-        #expect(hasStar, "SELECT without FROM should include * wildcard")
+        #expect(items.contains { $0.label == "FROM" }, "SELECT without FROM should offer FROM")
     }
 
     @Test("SELECT with prefix without FROM returns filtered items")

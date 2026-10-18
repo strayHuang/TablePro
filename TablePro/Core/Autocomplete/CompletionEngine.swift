@@ -170,7 +170,10 @@ final class CompletionEngine {
             isAfterComma: context.isAfterComma,
             expectsObjectName: context.expectsObjectName,
             comparisonColumn: context.comparisonColumn,
-            andContinuesJoin: context.andContinuesJoin
+            andContinuesJoin: context.andContinuesJoin,
+            joinConditionContinuation: context.joinConditionContinuation,
+            selectListHasField: context.selectListHasField,
+            selectListEndsWithStar: context.selectListEndsWithStar
         )
 
         return CompletionContext(

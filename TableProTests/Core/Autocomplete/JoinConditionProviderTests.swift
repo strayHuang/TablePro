@@ -88,6 +88,40 @@ struct JoinConditionProviderTests {
         #expect(item?.allowsFuzzyMatch == false)
     }
 
+    // MARK: - AND continuation
+
+    @Test("A condition inserts AND in front of itself when continued")
+    func conditionInsertsAndWhenContinued() {
+        let a = table("a", "alpha", columns: [column("code", type: "int", pk: true)])
+        let b = table("b", "beta", columns: [column("code", type: "int")])
+
+        let item = JoinConditionProvider.items(for: [a, b], continuedWithAnd: true).first
+        #expect(item?.label == "a.code = b.code")
+        #expect(item?.insertText == "AND a.code = b.code")
+    }
+
+    @Test("A continued condition matches the typed AND through its filter text")
+    func continuedConditionMatchesTypedAnd() {
+        let a = table("a", "alpha", columns: [column("code", type: "int", pk: true)])
+        let b = table("b", "beta", columns: [column("code", type: "int")])
+
+        // `and` is not a prefix of the bare label, so without the `and ` filter text the whole
+        // conditions would vanish the moment the keyword was typed.
+        let item = JoinConditionProvider.items(for: [a, b], continuedWithAnd: true).first
+        #expect(item?.filterText == "and a.code = b.code")
+        #expect(item?.allowsFuzzyMatch == false)
+    }
+
+    @Test("A condition written as the first one inserts itself unchanged")
+    func firstConditionInsertsUnchanged() {
+        let a = table("a", "alpha", columns: [column("code", type: "int", pk: true)])
+        let b = table("b", "beta", columns: [column("code", type: "int")])
+
+        let item = JoinConditionProvider.items(for: [a, b]).first
+        #expect(item?.insertText == "a.code = b.code")
+        #expect(item?.filterText == "a.code = b.code")
+    }
+
     // MARK: - Numeric fallback (Q5: similar names only)
 
     @Test("Numeric fallback fires only when the names are similar")
